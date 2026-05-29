@@ -1,6 +1,7 @@
 import copy
 import json
 import random
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -14,6 +15,7 @@ from lvar.controller_sft import action_type, compute_action_loss
 NEGATIVE_TYPES = ("same_image_wrong", "different_image_random", "same_image_noisy")
 CONTEXT_GLOBAL = "global_mean"
 CONTEXT_FULL = "full_context"
+ANSWER_SUFFIX_RE = re.compile(r"therefore,\s*the\s+answer\s+is\b.*", re.IGNORECASE | re.DOTALL)
 
 
 def load_counterfactual_pairs(path: str | Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -81,6 +83,15 @@ def _tokenize_target(model: torch.nn.Module, target_text: str) -> torch.Tensor:
         eos = torch.tensor([[int(eos_token_id)]], dtype=input_ids.dtype)
         input_ids = torch.cat([input_ids, eos], dim=1)
     return input_ids.to(model.device)
+
+
+def extract_answer_target_text(target_text: str) -> str:
+    """Return the answer-only suffix used for Phase 4 positive CE regularization."""
+    text = str(target_text or "").strip()
+    match = ANSWER_SUFFIX_RE.search(text)
+    if match:
+        return match.group(0).strip()
+    return text
 
 
 def differentiable_state_ce(model: torch.nn.Module, state: Dict[str, Any], target_text: str) -> torch.Tensor:
@@ -439,6 +450,7 @@ def replay_counterfactual_pair_loss(
     rank_margin: float = 0.1,
     positive_ce_weight: float = 0.2,
     rank_weight: float = 0.4,
+    controller_loss_weight: float = 1.0,
     noise_scale: float = 0.5,
     negative_bank_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
@@ -470,22 +482,32 @@ def replay_counterfactual_pair_loss(
     prefix_trace = pair.get("prefix_trace") or []
     positive_actions = pair.get("positive_actions") or []
     target_text = str(pair.get("target_text") or "")
+    answer_target_text = extract_answer_target_text(target_text)
 
     pos_state = model.clone_state(base_state)
     neg_state = model.clone_state(base_state)
     model.apply_mined_actions(pos_state, bank, prefix_trace)
     model.apply_mined_actions(neg_state, bank, prefix_trace)
 
-    ctrl_state = model.clone_state(pos_state)
-    l_ctrl, _, action_counts = compute_controller_loss_for_actions(model, ctrl_state, bank, positive_actions)
+    if float(controller_loss_weight) > 0.0:
+        ctrl_state = model.clone_state(pos_state)
+        l_ctrl, _, action_counts = compute_controller_loss_for_actions(model, ctrl_state, bank, positive_actions)
+    else:
+        l_ctrl = torch.zeros((), device=model.device, dtype=next(model.parameters()).dtype)
+        action_counts = Counter(str(action.get("type", "")).upper() for action in positive_actions)
 
     apply_counterfactual_actions(model, pos_state, bank, positive_actions)
     apply_counterfactual_actions(model, neg_state, bank, negative_actions)
 
     ce_pos = differentiable_state_ce(model, pos_state, target_text)
     ce_neg = differentiable_state_ce(model, neg_state, target_text)
+    ce_pos_answer = differentiable_state_ce(model, pos_state, answer_target_text)
     rank_loss = torch.relu(torch.tensor(float(rank_margin), device=ce_pos.device, dtype=ce_pos.dtype) + ce_pos - ce_neg)
-    total_loss = l_ctrl + float(positive_ce_weight) * ce_pos + float(rank_weight) * rank_loss
+    total_loss = (
+        float(controller_loss_weight) * l_ctrl
+        + float(positive_ce_weight) * ce_pos_answer
+        + float(rank_weight) * rank_loss
+    )
     margin = ce_neg.detach() - ce_pos.detach()
 
     metrics = {
@@ -494,10 +516,13 @@ def replay_counterfactual_pair_loss(
         "context_mode": context_mode,
         "ce_pos": float(ce_pos.detach().cpu().item()),
         "ce_neg": float(ce_neg.detach().cpu().item()),
+        "ce_pos_answer": float(ce_pos_answer.detach().cpu().item()),
+        "answer_target_text": answer_target_text,
         "margin": float(margin.cpu().item()),
         "rank_loss": float(rank_loss.detach().cpu().item()),
         "satisfied": bool((ce_pos.detach() + float(rank_margin) < ce_neg.detach()).cpu().item()),
         "l_ctrl": float(l_ctrl.detach().cpu().item()),
+        "controller_loss_weight": float(controller_loss_weight),
         "loss": float(total_loss.detach().cpu().item()),
         "action_counts": dict(action_counts),
     }
@@ -518,18 +543,19 @@ def phase4_parameter_groups(model: torch.nn.Module) -> Dict[str, List[torch.nn.P
     return {"controller": controller_params, "lora": lora_params}
 
 
-def set_phase4_trainable(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+def set_phase4_trainable(model: torch.nn.Module, train_controller: bool = True) -> List[torch.nn.Parameter]:
     """Train controller-facing parameters and LLM LoRA adapters only."""
     for parameter in model.parameters():
         parameter.requires_grad = False
 
-    trainable_modules = [model.controller, model.step_embedding]
-    controller_state_norm = getattr(model, "controller_state_norm", None)
-    if controller_state_norm is not None:
-        trainable_modules.append(controller_state_norm)
-    for module in trainable_modules:
-        for parameter in module.parameters():
-            parameter.requires_grad = True
+    if train_controller:
+        trainable_modules = [model.controller, model.step_embedding]
+        controller_state_norm = getattr(model, "controller_state_norm", None)
+        if controller_state_norm is not None:
+            trainable_modules.append(controller_state_norm)
+        for module in trainable_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
 
     for name, parameter in model.named_parameters():
         if "lora_" in name:
@@ -577,7 +603,7 @@ class CounterfactualMetricTracker:
             return
         self.count += 1
         self.action_counts.update(metrics.get("action_counts", {}))
-        numeric_keys = ["ce_pos", "ce_neg", "margin", "rank_loss", "satisfied", "l_ctrl", "loss"]
+        numeric_keys = ["ce_pos", "ce_neg", "ce_pos_answer", "margin", "rank_loss", "satisfied", "l_ctrl", "loss"]
         for key in numeric_keys:
             value = float(metrics[key])
             self.global_values[key] += value

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import yaml
+from tqdm import tqdm
 
 # Allow running as a script: `python scripts/train_counterfactual.py ...`.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -90,7 +91,8 @@ def main() -> None:
     model = QwenLVAR(model_cfg)
     loaded_controller = maybe_load_controller_checkpoint(model, phase4_cfg.get("controller_checkpoint_path"))
     model.train()
-    trainable_params = set_phase4_trainable(model)
+    train_controller = bool(phase4_cfg.get("train_controller", False))
+    trainable_params = set_phase4_trainable(model, train_controller=train_controller)
     if not trainable_params:
         raise ValueError("No trainable Phase 4 parameters were found.")
     parameter_groups = phase4_parameter_groups(model)
@@ -121,6 +123,7 @@ def main() -> None:
     rank_margin = float(phase4_cfg.get("rank_margin", 0.1))
     positive_ce_weight = float(phase4_cfg.get("positive_ce_weight", 0.2))
     rank_weight = float(phase4_cfg.get("rank_weight", 0.3))
+    controller_loss_weight = float(phase4_cfg.get("controller_loss_weight", 1.0 if train_controller else 0.0))
     noise_scale = float(phase4_cfg.get("noise_scale", 0.5))
 
     tracker = CounterfactualMetricTracker()
@@ -129,12 +132,20 @@ def main() -> None:
     skipped_missing = 0
 
     for epoch in range(num_epochs):
-        for pair in pairs:
+        epoch_trained_pairs = 0
+        progress = tqdm(
+            pairs,
+            total=len(pairs),
+            desc=f"Phase 4 counterfactual epoch {epoch + 1}/{num_epochs}",
+            dynamic_ncols=True,
+        )
+        for pair in progress:
             example_id = str(pair.get("example_id"))
             source_example = example_index.get(example_id)
             if source_example is None:
                 skipped_missing += 1
                 tracker.update({"skip_reason": "missing_source_example"})
+                progress.set_postfix(trained=epoch_trained_pairs, skipped=skipped_missing)
                 continue
 
             optimizer.zero_grad(set_to_none=True)
@@ -150,11 +161,17 @@ def main() -> None:
                 rank_margin=rank_margin,
                 positive_ce_weight=positive_ce_weight,
                 rank_weight=rank_weight,
+                controller_loss_weight=controller_loss_weight,
                 noise_scale=noise_scale,
                 negative_bank_cache=negative_bank_cache,
             )
             tracker.update(metrics)
             if loss is None:
+                progress.set_postfix(
+                    trained=epoch_trained_pairs,
+                    skipped=skipped_missing,
+                    skip=metrics.get("skip_reason", "pair_skipped"),
+                )
                 continue
 
             loss.backward()
@@ -163,12 +180,21 @@ def main() -> None:
             optimizer.step()
 
             global_step += 1
+            epoch_trained_pairs += 1
+            summary = tracker.summary()["global"]
+            progress.set_postfix(
+                loss=f"{metrics['loss']:.4f}",
+                margin=f"{metrics['margin']:.4f}",
+                mean_margin=f"{summary.get('margin', 0.0):.4f}",
+                trained=epoch_trained_pairs,
+                skipped=skipped_missing,
+            )
             if log_every > 0 and global_step % log_every == 0:
-                summary = tracker.summary()["global"]
-                print(
+                tqdm.write(
                     f"step={global_step} epoch={epoch + 1}/{num_epochs} "
                     f"loss={metrics['loss']:.4f} ce_pos={metrics['ce_pos']:.4f} "
-                    f"ce_neg={metrics['ce_neg']:.4f} margin={metrics['margin']:.4f} "
+                    f"ce_neg={metrics['ce_neg']:.4f} "
+                    f"ce_pos_answer={metrics['ce_pos_answer']:.4f} margin={metrics['margin']:.4f} "
                     f"neg={metrics['negative_type']} context={metrics['context_mode']} "
                     f"mean_margin={summary.get('margin', 0.0):.4f}"
                 )
@@ -180,22 +206,25 @@ def main() -> None:
                 "trace_path": str(trace_path),
                 "num_pairs": len(pairs),
                 "trained_pairs": tracker.count,
+                "trained_pairs_this_epoch": epoch_trained_pairs,
                 "skipped_missing_examples": skipped_missing,
                 "loaded_controller_checkpoint": loaded_controller,
                 "negative_type_probs": negative_type_probs,
                 "controller_lr": controller_lr,
                 "lora_lr": lora_lr,
+                "train_controller": train_controller,
                 "context_full_probability": context_full_probability,
                 "rank_margin": rank_margin,
                 "positive_ce_weight": positive_ce_weight,
                 "rank_weight": rank_weight,
+                "controller_loss_weight": controller_loss_weight,
                 "noise_scale": noise_scale,
                 "summary": tracker.summary(),
                 "seed": seed,
             }
             epoch_checkpoint_path = output_dir / f"counterfactual_epoch_{epoch + 1}.pt"
             save_phase4_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
-            print(f"Saved Phase 4 epoch checkpoint to {epoch_checkpoint_path}")
+            tqdm.write(f"Saved Phase 4 epoch checkpoint to {epoch_checkpoint_path}")
 
     if tracker.count == 0:
         raise ValueError("No Phase 4 pairs were trained; inspect skip reasons in the trace/config.")
@@ -210,10 +239,12 @@ def main() -> None:
         "negative_type_probs": negative_type_probs,
         "controller_lr": controller_lr,
         "lora_lr": lora_lr,
+        "train_controller": train_controller,
         "context_full_probability": context_full_probability,
         "rank_margin": rank_margin,
         "positive_ce_weight": positive_ce_weight,
         "rank_weight": rank_weight,
+        "controller_loss_weight": controller_loss_weight,
         "noise_scale": noise_scale,
         "summary": tracker.summary(),
         "seed": seed,

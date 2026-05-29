@@ -55,21 +55,23 @@ phase4:
   output_dir: outputs/counterfactual_m3cot
   controller_lr: 0.0001
   lora_lr: 0.00002
+  train_controller: false
+  controller_loss_weight: 0.0
   weight_decay: 0.0
-  num_epochs: 1
+  num_epochs: 3
   max_pairs:
   grad_clip_norm: 1.0
-  log_every: 10
+  log_every: 100
   image_size: 280
   controller_max_steps: 32
   context_full_probability: 0.2
   negative_type_probs:
-    same_image_wrong: 0.5
-    different_image_random: 0.35
-    same_image_noisy: 0.15
+    same_image_wrong: 0.7
+    different_image_random: 0.3
+    same_image_noisy: 0.0
   rank_margin: 0.1
-  positive_ce_weight: 0.2
-  rank_weight: 0.3
+  positive_ce_weight: 0.5
+  rank_weight: 0.35
   noise_scale: 0.5
 
 phase5:

@@ -420,11 +420,11 @@ class QwenLVAR(nn.Module):
         clean_state_dict = self._clean_checkpoint_state_dict(state_dict)
         aligned_state_dict = self._align_checkpoint_state_dict(clean_state_dict, self.backbone.state_dict())
         missing, unexpected = self.backbone.load_state_dict(aligned_state_dict, strict=False)
-        print(f"Loaded backbone checkpoint: {self.checkpoint_path}")
-        print("Missing backbone keys:", len(missing))
-        print("Unexpected backbone keys:", len(unexpected))
-        print("First missing backbone keys:", missing[:20])
-        print("First unexpected backbone keys:", unexpected[:20])
+        # print(f"Loaded backbone checkpoint: {self.checkpoint_path}")
+        # print("Missing backbone keys:", len(missing))
+        # print("Unexpected backbone keys:", len(unexpected))
+        # print("First missing backbone keys:", missing[:20])
+        # print("First unexpected backbone keys:", unexpected[:20])
         if bool(self.cfg.get("merge_lora", False)):
             if not hasattr(self.backbone, "merge_and_unload"):
                 raise ValueError("merge_lora is true, but the backbone is not a mergeable PEFT model.")
