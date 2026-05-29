@@ -33,6 +33,73 @@ phase2:
   output_path: outputs/phase2_m3cot_traces.jsonl
   initial_visual_mode: global_mean
 
+phase3:
+  seed: 42
+  trace_path: outputs/phase2_m3cot_traces.jsonl
+  output_dir: outputs/controller_sft_m3cot
+  learning_rate: 0.0002
+  weight_decay: 0.0
+  num_epochs: 3
+  max_examples:
+  grad_clip_norm: 1.0
+  log_every: 10
+  image_size: 280
+  controller_max_steps: 20
+  full_context_probability: 0.1
+
+phase4:
+  seed: 42
+  trace_path: outputs/phase2_m3cot_traces.jsonl
+  controller_checkpoint_path: outputs/controller_sft_m3cot/controller_sft.pt
+  output_dir: outputs/counterfactual_m3cot
+  controller_lr: 0.0001
+  lora_lr: 0.00002
+  weight_decay: 0.0
+  num_epochs: 1
+  max_pairs:
+  grad_clip_norm: 1.0
+  log_every: 10
+  image_size: 280
+  controller_max_steps: 20
+  context_full_probability: 0.2
+  negative_type_probs:
+    same_image_wrong: 0.5
+    different_image_random: 0.35
+    same_image_noisy: 0.15
+  rank_margin: 0.1
+  positive_ce_weight: 0.2
+  rank_weight: 0.3
+  noise_scale: 0.5
+
+phase5:
+  seed: 42
+  dataset_partition: validation
+  phase4_checkpoint_path: outputs/counterfactual_m3cot/counterfactual.pt
+  output_dir: outputs/grpo_phase5_m3cot
+  controller_lr: 0.00005
+  weight_decay: 0.0
+  num_epochs: 1
+  max_examples:
+  group_size: 6
+  update_epochs: 1
+  grad_clip_norm: 1.0
+  log_every: 10
+  image_size: 280
+  controller_max_steps: 20
+  max_controller_steps: 20
+  rollout_temperature: 1.5
+  clip_epsilon: 0.2
+  logp_weight: 0.2
+  counterfactual_weight: 0.3
+  use_counterfactual_reward: true
+  cf_random_image_probability: 0.35
+  no_stop_penalty: 0.2
+  advantage_epsilon: 0.000001
+  improve_weight: 1.5
+  miss_weight: 1.0
+  already_correct_weight: 0.5
+  regression_weight: 1.5
+
 train:
   seed: 42
   learning_rate: 0.0001
@@ -46,7 +113,10 @@ train:
 
 inference:
   limit:
-  output_path: outputs/m3cot_pooling_predictions.jsonl
+  output_path: outputs/m3cot_lvar_predictions.jsonl
+  dataset_partition: test
+  controller_checkpoint_path: ""
+  action_selection: argmax
 
 debug:
   index: 0

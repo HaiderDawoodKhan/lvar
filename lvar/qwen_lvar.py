@@ -141,11 +141,16 @@ class QwenLVAR(nn.Module):
         self.use_control_tokens = bool(cfg.get("use_control_tokens", False))
         self.think_append_hidden = bool(cfg.get("think_append_hidden", True))
         self.controller_num_states = int(cfg.get("controller_context_window", 3))
+        self.controller_max_steps = int(cfg.get("controller_max_steps", self.max_steps))
         self.checkpoint_path = cfg.get("checkpoint_path") or cfg.get("ivtlr_checkpoint_path")
         self.use_checkpoint = bool(cfg.get("use_checkpoint", bool(self.checkpoint_path)))
 
         if self.controller_temperature <= 0.0:
             raise ValueError("controller_temperature must be greater than 0.")
+        if self.controller_num_states <= 0:
+            raise ValueError("controller_context_window must be greater than 0.")
+        if self.controller_max_steps <= 0:
+            raise ValueError("controller_max_steps must be greater than 0.")
         if self.use_checkpoint and not self.checkpoint_path:
             raise ValueError("use_checkpoint is true but no checkpoint_path was provided.")
 
@@ -186,13 +191,14 @@ class QwenLVAR(nn.Module):
         self.act_token = nn.Parameter(torch.randn(self.hidden_size) * 0.02)
         self.global_pool = nn.Linear(self.hidden_size, 1)
         self.region_pool = nn.Linear(self.hidden_size, 1)
+        self.controller_state_norm = nn.LayerNorm(self.hidden_size)
         self.controller = ControllerHead(
             self.hidden_size,
             len(ACTION_NAMES),
             use_control_tokens=self.use_control_tokens,
             controller_num_states=self.controller_num_states,
         )
-        self.step_embedding = nn.Embedding(self.max_steps, self.hidden_size)
+        self.step_embedding = nn.Embedding(self.controller_max_steps, self.hidden_size)
 
         # Freeze backbone to keep training focused on controller-driven reasoning behavior.
         for parameter in self.backbone.parameters():
@@ -274,6 +280,77 @@ class QwenLVAR(nn.Module):
             inference_mode=bool(lora_cfg.get("inference_mode", False)),
         )
         self.backbone = get_peft_model(self.backbone, config)
+
+    def _get_backbone_child(self, module: nn.Module, name: str) -> Optional[nn.Module]:
+        """Safely fetch a child module across PEFT/wrapper implementations."""
+        try:
+            child = getattr(module, name)
+        except AttributeError:
+            return None
+        return child if isinstance(child, nn.Module) else None
+
+    def _resolve_visual_encoder(self, required: bool = True) -> Optional[nn.Module]:
+        """
+        Locate Qwen2-VL's vision encoder across HF/PEFT version differences.
+
+        Some Transformers releases expose the encoder as ``backbone.visual``;
+        others place it under nested modules such as ``backbone.model.visual``.
+        PEFT wrappers add another layer, so mining utilities should not assume a
+        single attribute path.
+        """
+        cached = getattr(self, "_visual_encoder_cache", None)
+        if cached is not None:
+            return cached
+
+        queue: list[tuple[nn.Module, int]] = [(self.backbone, 0)]
+        seen: set[int] = set()
+        visual_names = ("visual", "vision_tower", "vision_model")
+        wrapper_names = ("base_model", "model", "module")
+
+        while queue:
+            module, depth = queue.pop(0)
+            module_id = id(module)
+            if module_id in seen or depth > 4:
+                continue
+            seen.add(module_id)
+
+            for name in visual_names:
+                child = self._get_backbone_child(module, name)
+                if child is not None:
+                    self._visual_encoder_cache = child
+                    return child
+
+            for name in wrapper_names:
+                child = self._get_backbone_child(module, name)
+                if child is not None:
+                    queue.append((child, depth + 1))
+
+        try:
+            for name, child in self.backbone.named_modules():
+                if name.endswith(".visual") or name == "visual":
+                    self._visual_encoder_cache = child
+                    return child
+        except Exception:
+            pass
+
+        if required:
+            raise ValueError(
+                "Could not locate the Qwen2-VL visual encoder. Checked common paths "
+                "including backbone.visual, backbone.model.visual, and PEFT base_model wrappers."
+            )
+        return None
+
+    def _resolve_spatial_merge_size(self) -> int:
+        visual = self._resolve_visual_encoder(required=False)
+        if visual is not None and hasattr(visual, "spatial_merge_size"):
+            return int(getattr(visual, "spatial_merge_size", 1))
+
+        config = getattr(self.backbone, "config", None)
+        vision_config = getattr(config, "vision_config", None)
+        for owner in (vision_config, config):
+            if owner is not None and hasattr(owner, "spatial_merge_size"):
+                return int(getattr(owner, "spatial_merge_size", 1))
+        return 1
 
     def _maybe_resize_token_embeddings(self) -> None:
         """Resize embeddings after special tokens are attached to the processor tokenizer."""
@@ -443,7 +520,7 @@ class QwenLVAR(nn.Module):
             H = int(image_grid_thw[-2].item())
             W = int(image_grid_thw[-1].item())
 
-        merge = int(getattr(self.backbone.visual, "spatial_merge_size", 1))
+        merge = self._resolve_spatial_merge_size()
         if H % merge != 0 or W % merge != 0:
             raise ValueError(f"Pre-merge grid {(H,W)} not divisible by merge size {merge}.")
 
@@ -712,16 +789,15 @@ class QwenLVAR(nn.Module):
             self._current_postmerge_grid = None
             self._current_image_grid = None
             
-        if not hasattr(self.backbone, "visual"):
-            raise ValueError("The backbone does not expose a visual encoder for projected image tokens.")
+        visual = self._resolve_visual_encoder(required=True)
         # Support minor signature differences across backbone/test doubles.
         try:
-            image_tokens = self.backbone.visual(pixel_values, grid_thw=image_grid_thw)
+            image_tokens = visual(pixel_values, grid_thw=image_grid_thw)
         except TypeError:
             try:
-                image_tokens = self.backbone.visual(pixel_values, image_grid_thw)
+                image_tokens = visual(pixel_values, image_grid_thw)
             except TypeError:
-                image_tokens = self.backbone.visual(pixel_values)
+                image_tokens = visual(pixel_values)
         if image_tokens.dim() == 3:
             image_tokens = image_tokens[0]
             
@@ -900,6 +976,57 @@ class QwenLVAR(nn.Module):
             act_hidden = None
         return last_hidden, state_hidden, act_hidden
 
+    def _controller_step_hidden(self, step_idx: int) -> torch.Tensor:
+        """Embed the primitive controller step used by SFT/rollout policy calls."""
+        if step_idx < 0 or step_idx >= self.step_embedding.num_embeddings:
+            raise ValueError(
+                f"controller step {step_idx} is outside step_embedding capacity "
+                f"{self.step_embedding.num_embeddings}; increase model.controller_max_steps."
+            )
+        return self.step_embedding(torch.tensor([step_idx], device=self.device, dtype=torch.long))
+
+    def _build_controller_state_hidden(
+        self,
+        final_hidden: torch.Tensor,
+        state: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Build normalized controller context from the final hidden-state sequence."""
+        if self.use_control_tokens:
+            state_hidden = self.controller_state_norm(final_hidden[:, state["latent_pos"], :])
+            act_hidden = self.controller_state_norm(final_hidden[:, state["act_pos"], :])
+            return state_hidden, act_hidden
+
+        n_states = self.controller_num_states
+        if final_hidden.size(1) < n_states:
+            raise ValueError(
+                f"controller_context_window={n_states} requires at least {n_states} hidden states, "
+                f"got sequence length {final_hidden.size(1)}."
+            )
+        last_n = final_hidden[:, -n_states:, :]
+        normalized = self.controller_state_norm(last_n)
+        state_hidden = normalized.reshape(normalized.size(0), -1)
+        return state_hidden, None
+
+    def controller_logits_from_state(
+        self,
+        state: Dict[str, Any],
+        bank: Dict[str, torch.Tensor],
+        step_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return raw controller logits for the current recurrent state."""
+        with torch.no_grad():
+            outputs = self.backbone(
+                inputs_embeds=state["inputs_embeds"],
+                attention_mask=state["attention_mask"],
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+        final_hidden = self._extract_final_hidden(outputs)
+        state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
+        step_hidden = self._controller_step_hidden(step_idx)
+        return self.controller(state_hidden, step_hidden, bank, act_hidden=act_hidden)
+
     def apply_mined_actions(
         self,
         state: Dict[str, Any],
@@ -962,17 +1089,14 @@ class QwenLVAR(nn.Module):
         final_hidden = self._extract_final_hidden(outputs)
         last_hidden = final_hidden[:, -1, :]
         if self.use_control_tokens:
-            state_hidden = final_hidden[:, state["latent_pos"], :]
-            act_hidden = final_hidden[:, state["act_pos"], :]
+            recurrent_state_hidden = final_hidden[:, state["latent_pos"], :]
+            recurrent_act_hidden = final_hidden[:, state["act_pos"], :]
         else:
-            n_states = self.controller_num_states
-            last_n = final_hidden[:, -n_states:, :]
-            state_hidden = last_n.reshape(last_n.size(0), -1)
-            act_hidden = None
+            recurrent_state_hidden = last_hidden
+            recurrent_act_hidden = None
+        state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         # Step embedding gives the controller explicit notion of iteration depth.
-        step_hidden = self.step_embedding(
-            torch.tensor([step_idx], device=self.device, dtype=torch.long)
-        )
+        step_hidden = self._controller_step_hidden(step_idx)
         type_logits, region_logits, patch_logits = self.controller(
             state_hidden,
             step_hidden,
@@ -1026,8 +1150,8 @@ class QwenLVAR(nn.Module):
                     state["inputs_embeds"],
                     state["latent_pos"],
                     state["act_pos"],
-                    state_hidden,
-                    act_hidden,
+                    recurrent_state_hidden,
+                    recurrent_act_hidden,
                 )
             else:
                 updated_embeds = state["inputs_embeds"].clone()
@@ -1151,20 +1275,21 @@ class QwenLVAR(nn.Module):
         questions: Any,
         labels: Optional[Any] = None,
         sample_actions: Optional[bool] = None,
+        add_answer_instruction: bool = True,
+        use_coarse_context: bool = False,
     ) -> Dict[str, Any]:
         """
         Main LVAR path: prepare -> visual bank -> recurrent loop -> act drop -> decode.
         """
         # Build model-ready inputs and visual candidate bank.
-        prepared = self.prepare_inputs(images, questions)
+        prepared = self.prepare_inputs(images, questions, add_answer_instruction=add_answer_instruction)
         image_tokens = self.get_projected_image_tokens(prepared)
         prepared["projected_image_tokens"] = image_tokens
-        # print("image_tokens.shape:", image_tokens.shape)
-        # print("num_tokens:", image_tokens.squeeze(0).size(0))
-        # print("_current_image_grid:", self._current_image_grid)
-        # print("region_window:", self.region_window)
         bank = self.build_visual_bank(image_tokens)
-        state = self.build_initial_state(prepared)
+        if use_coarse_context:
+            state = self.build_coarse_initial_state(prepared, bank)
+        else:
+            state = self.build_initial_state(prepared)
         if sample_actions is None:
             # During training we always sample; during inference defer to config.
             state["sample_actions"] = self.training or self._inference_uses_sampling()

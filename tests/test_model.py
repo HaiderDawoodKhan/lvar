@@ -2,7 +2,9 @@ import types
 import unittest
 
 import torch
+import torch.nn.functional as F
 
+from lvar.controller_sft import set_controller_sft_trainable
 from lvar.qwen_lvar import QwenLVAR
 from lvar.utils import (
     ACTION_GLOBAL,
@@ -141,6 +143,15 @@ class DummyBackbone(torch.nn.Module):
         )
 
 
+class DummyNestedVisualBackbone(DummyBackbone):
+    def __init__(self, spatial_merge_size=1):
+        super().__init__(spatial_merge_size=spatial_merge_size)
+        visual = self.visual
+        del self.visual
+        self.model = torch.nn.Module()
+        self.model.visual = visual
+
+
 def build_model(**overrides):
     cfg = {
         "device": "cpu",
@@ -168,6 +179,23 @@ def build_merged_grid_model():
     return QwenLVAR(
         cfg,
         backbone=DummyBackbone(spatial_merge_size=2),
+        processor=DummyMergedGridProcessor(),
+    )
+
+
+def build_nested_visual_model():
+    cfg = {
+        "device": "cpu",
+        "dtype": "float32",
+        "max_steps": 3,
+        "region_window": 1,
+        "max_answer_tokens": 1,
+        "action_selection": "argmax",
+        "controller_context_window": 1,
+    }
+    return QwenLVAR(
+        cfg,
+        backbone=DummyNestedVisualBackbone(spatial_merge_size=2),
         processor=DummyMergedGridProcessor(),
     )
 
@@ -287,6 +315,14 @@ class QwenLVARTests(unittest.TestCase):
         self.assertEqual(tuple(model._current_postmerge_grid), (2, 2))
         self.assertEqual(tuple(bank["patches"].shape), (4, 4))
 
+    def test_projected_image_tokens_resolve_nested_visual_encoder(self):
+        model = build_nested_visual_model()
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        bank = model.build_visual_bank(projected)
+        self.assertEqual(tuple(model._current_postmerge_grid), (2, 2))
+        self.assertEqual(tuple(bank["patches"].shape), (4, 4))
+
     def test_build_visual_bank_pads_non_divisible_grid(self):
         model = build_model()
         model.region_window = 2
@@ -353,7 +389,7 @@ class QwenLVARTests(unittest.TestCase):
 
         self.model.forward_reasoning_step(state, self.bank, 0)
 
-        expected = state["inputs_embeds"][:, -1, :] + 0.05
+        expected = F.layer_norm(state["inputs_embeds"][:, -1, :] + 0.05, (self.model.hidden_size,))
         self.assertTrue(torch.allclose(capture["state_hidden"], expected))
         self.assertIsNone(capture["act_hidden"])
         self.assertEqual(tuple(capture["step_hidden"].shape), (1, 4))
@@ -399,7 +435,7 @@ class QwenLVARTests(unittest.TestCase):
         model.forward_reasoning_step(state, bank, 0)
 
         self.assertEqual(calls, [True])
-        expected = state["inputs_embeds"][:, -1, :] + 0.05
+        expected = F.layer_norm(state["inputs_embeds"][:, -1, :] + 0.05, (model.hidden_size,))
         self.assertTrue(torch.allclose(capture["state_hidden"], expected))
 
     def test_forward_reasoning_actions_tokenless(self):
@@ -571,6 +607,29 @@ class QwenLVARTests(unittest.TestCase):
         model.forward_reasoning_step(state, bank, 0)
 
         self.assertEqual(tuple(capture["state_hidden"].shape), (1, 12))
+        expected_hidden = state["inputs_embeds"] + torch.arange(
+            state["inputs_embeds"].size(1),
+            dtype=state["inputs_embeds"].dtype,
+        ).view(1, -1, 1) * 0.01
+        expected = F.layer_norm(expected_hidden[:, -3:, :], (model.hidden_size,)).reshape(1, -1)
+        self.assertTrue(torch.allclose(capture["state_hidden"], expected))
+
+    def test_phase3_trainable_filter_keeps_only_controller_facing_params(self):
+        model = build_model(controller_context_window=3, controller_max_steps=16)
+
+        trainable = set_controller_sft_trainable(model)
+        trainable_names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+
+        self.assertTrue(trainable)
+        self.assertIn("controller_state_norm.weight", trainable_names)
+        self.assertIn("controller_state_norm.bias", trainable_names)
+        self.assertTrue(any(name.startswith("controller.") for name in trainable_names))
+        self.assertIn("step_embedding.weight", trainable_names)
+        self.assertNotIn("latent_token", trainable_names)
+        self.assertNotIn("act_token", trainable_names)
+        self.assertFalse(any(name.startswith("global_pool.") for name in trainable_names))
+        self.assertFalse(any(name.startswith("region_pool.") for name in trainable_names))
+        self.assertFalse(any(name.startswith("backbone.") for name in trainable_names))
 
     def test_region_inserts_raw_patches(self):
         model = build_model(controller_context_window=1, region_window=2)

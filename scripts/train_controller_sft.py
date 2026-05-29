@@ -1,0 +1,190 @@
+import argparse
+import json
+import random
+import sys
+from collections import Counter
+from pathlib import Path
+
+import torch
+import yaml
+
+# Allow running as a script: `python scripts/train_controller_sft.py ...`.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lvar.controller_sft import (
+    build_example_index,
+    load_mined_trace_rows,
+    replay_controller_sft_loss,
+    save_controller_sft_checkpoint,
+    set_controller_sft_trainable,
+    set_seed,
+)
+from lvar.dataset import build_dataset
+from lvar.qwen_lvar import QwenLVAR
+from lvar.utils import ACTION_NAMES, add_model_loading_args, apply_model_loading_overrides
+
+
+def load_config(config_path: str):
+    """Load YAML config values shared across scripts."""
+    with open(config_path, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def main() -> None:
+    """Train the Phase 3 controller from Phase 2 mined traces."""
+    parser = argparse.ArgumentParser(description="Train the Phase 3 controller with SFT over mined traces.")
+    parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
+    parser.add_argument("--trace-jsonl", default=None, help="Override phase3.trace_path.")
+    parser.add_argument("--limit", type=int, default=None, help="Limit mined trace rows used for SFT.")
+    parser.add_argument("--seed", type=int, default=None, help="Override phase3.seed.")
+    parser.add_argument("--output-dir", default=None, help="Override phase3.output_dir.")
+    add_model_loading_args(parser)
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    phase3_cfg = config.get("phase3", {})
+    dataset_cfg = config["dataset"]
+    model_cfg = apply_model_loading_overrides(config["model"], args)
+
+    if "controller_max_steps" in phase3_cfg:
+        model_cfg["controller_max_steps"] = int(phase3_cfg["controller_max_steps"])
+
+    seed = int(args.seed if args.seed is not None else phase3_cfg.get("seed", config.get("train", {}).get("seed", 42)))
+    set_seed(seed)
+
+    trace_path = Path(args.trace_jsonl or phase3_cfg.get("trace_path", "outputs/phase2_m3cot_traces.jsonl"))
+    output_dir = Path(args.output_dir or phase3_cfg.get("output_dir", "outputs/controller_sft_m3cot"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    trace_limit = args.limit if args.limit is not None else phase3_cfg.get("max_examples")
+    rows = load_mined_trace_rows(trace_path, limit=trace_limit)
+    if not rows:
+        raise ValueError(f"No mined trace rows found in {trace_path}.")
+
+    dataset_options = dict(dataset_cfg)
+    dataset_partition = phase3_cfg.get("dataset_partition")
+    dataset_limit = phase3_cfg.get("dataset_limit", dataset_cfg.get("limit"))
+    dataset = build_dataset(dataset_options, limit=dataset_limit, partition=dataset_partition)
+    example_index = build_example_index(dataset)
+
+    model = QwenLVAR(model_cfg)
+    model.train()
+    trainable_params = set_controller_sft_trainable(model)
+    if not trainable_params:
+        raise ValueError("No trainable controller parameters were found.")
+
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=float(phase3_cfg.get("learning_rate", 1e-4)),
+        weight_decay=float(phase3_cfg.get("weight_decay", 0.0)),
+    )
+
+    num_epochs = int(phase3_cfg.get("num_epochs", 1))
+    grad_clip_norm = float(phase3_cfg.get("grad_clip_norm", 1.0))
+    log_every = int(phase3_cfg.get("log_every", 10))
+    image_size = phase3_cfg.get("image_size", config.get("phase2", {}).get("image_size", 280))
+    full_context_probability = float(phase3_cfg.get("full_context_probability", 0.1))
+    if full_context_probability < 0.0 or full_context_probability > 1.0:
+        raise ValueError("phase3.full_context_probability must be in [0, 1].")
+    context_rng = random.Random(seed)
+
+    global_step = 0
+    skipped_missing = 0
+    action_totals: Counter[str] = Counter()
+    initial_visual_totals: Counter[str] = Counter()
+    loss_total = 0.0
+    trained_examples = 0
+
+    for epoch in range(num_epochs):
+        for row in rows:
+            example_id = str(row.get("example_id"))
+            source_example = example_index.get(example_id)
+            if source_example is None:
+                skipped_missing += 1
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            loss, metrics = replay_controller_sft_loss(
+                model,
+                row,
+                source_example,
+                image_size=image_size,
+                full_context_probability=full_context_probability,
+                rng=context_rng,
+            )
+            loss.backward()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_norm)
+            optimizer.step()
+
+            global_step += 1
+            trained_examples += 1
+            loss_value = float(loss.detach().item())
+            loss_total += loss_value
+            action_totals.update(metrics["action_counts"])
+            initial_visual_totals.update([metrics["initial_visual_mode"]])
+
+            if log_every > 0 and global_step % log_every == 0:
+                mean_loss = loss_total / max(1, trained_examples)
+                print(
+                    f"step={global_step} epoch={epoch + 1}/{num_epochs} "
+                    f"loss={loss_value:.4f} mean_loss={mean_loss:.4f} "
+                    f"targets={metrics['num_targets']} "
+                    f"initial_visual={metrics['initial_visual_mode']} example_id={example_id}"
+                )
+
+        if trained_examples > 0:
+            epoch_metadata = {
+                "phase": "phase3_controller_sft",
+                "epoch": epoch + 1,
+                "trace_path": str(trace_path),
+                "num_trace_rows": len(rows),
+                "trained_examples": trained_examples,
+                "skipped_missing_examples": skipped_missing,
+                "mean_loss": loss_total / max(1, trained_examples),
+                "action_counts": dict(action_totals),
+                "initial_visual_counts": dict(initial_visual_totals),
+                "full_context_probability": full_context_probability,
+                "action_names": ACTION_NAMES,
+                "controller_context_window": model.controller_num_states,
+                "controller_max_steps": model.step_embedding.num_embeddings,
+                "seed": seed,
+            }
+            epoch_checkpoint_path = output_dir / f"controller_sft_epoch_{epoch + 1}.pt"
+            save_controller_sft_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
+            print(f"Saved Phase 3 epoch checkpoint to {epoch_checkpoint_path}")
+
+    if trained_examples == 0:
+        raise ValueError(
+            "No mined rows matched the source dataset by example_id; "
+            "check phase3.dataset_partition/dataset_limit and the trace file."
+        )
+
+    metadata = {
+        "phase": "phase3_controller_sft",
+        "trace_path": str(trace_path),
+        "num_trace_rows": len(rows),
+        "trained_examples": trained_examples,
+        "skipped_missing_examples": skipped_missing,
+        "mean_loss": loss_total / max(1, trained_examples),
+        "action_counts": dict(action_totals),
+        "initial_visual_counts": dict(initial_visual_totals),
+        "full_context_probability": full_context_probability,
+        "action_names": ACTION_NAMES,
+        "controller_context_window": model.controller_num_states,
+        "controller_max_steps": model.step_embedding.num_embeddings,
+        "seed": seed,
+    }
+
+    checkpoint_path = output_dir / "controller_sft.pt"
+    save_controller_sft_checkpoint(model, checkpoint_path, metadata=metadata)
+    with open(output_dir / "controller_sft_summary.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+    print(f"Saved Phase 3 controller SFT checkpoint to {checkpoint_path}")
+    print(f"Saved Phase 3 summary to {output_dir / 'controller_sft_summary.json'}")
+
+
+if __name__ == "__main__":
+    main()
