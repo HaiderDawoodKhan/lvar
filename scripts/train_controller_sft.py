@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 import yaml
+from tqdm import tqdm
 
 # Allow running as a script: `python scripts/train_controller_sft.py ...`.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,21 @@ def load_config(config_path: str):
     """Load YAML config values shared across scripts."""
     with open(config_path, "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def update_weighted_means(totals, counts, means, mean_counts) -> None:
+    """Accumulate weighted scalar means from per-example metric dictionaries."""
+    for key, value in means.items():
+        count = int(mean_counts.get(key, 0))
+        if count <= 0:
+            continue
+        totals[key] += float(value) * count
+        counts[key] += count
+
+
+def finalize_weighted_means(totals, counts):
+    """Return weighted means for JSON/logging."""
+    return {key: totals[key] / max(1, counts[key]) for key in totals}
 
 
 def main() -> None:
@@ -94,11 +110,23 @@ def main() -> None:
     skipped_missing = 0
     action_totals: Counter[str] = Counter()
     initial_visual_totals: Counter[str] = Counter()
+    loss_component_totals: Counter[str] = Counter()
+    loss_component_counts: Counter[str] = Counter()
+    action_loss_totals: Counter[str] = Counter()
+    action_loss_counts: Counter[str] = Counter()
+    logit_stat_totals: Counter[str] = Counter()
+    logit_stat_counts: Counter[str] = Counter()
     loss_total = 0.0
     trained_examples = 0
 
     for epoch in range(num_epochs):
-        for row in rows:
+        progress = tqdm(
+            rows,
+            total=len(rows),
+            desc=f"Phase 3 SFT epoch {epoch + 1}/{num_epochs}",
+            dynamic_ncols=True,
+        )
+        for row in progress:
             example_id = str(row.get("example_id"))
             source_example = example_index.get(example_id)
             if source_example is None:
@@ -125,12 +153,43 @@ def main() -> None:
             loss_total += loss_value
             action_totals.update(metrics["action_counts"])
             initial_visual_totals.update([metrics["initial_visual_mode"]])
+            update_weighted_means(
+                loss_component_totals,
+                loss_component_counts,
+                metrics.get("loss_components", {}),
+                metrics.get("loss_component_counts", {}),
+            )
+            update_weighted_means(
+                action_loss_totals,
+                action_loss_counts,
+                metrics.get("action_loss_means", {}),
+                metrics.get("action_loss_counts", {}),
+            )
+            update_weighted_means(
+                logit_stat_totals,
+                logit_stat_counts,
+                metrics.get("logit_stats", {}),
+                metrics.get("logit_stat_counts", {}),
+            )
+            mean_components = finalize_weighted_means(loss_component_totals, loss_component_counts)
+            mean_loss = loss_total / max(1, trained_examples)
+            progress.set_postfix(
+                loss=f"{loss_value:.4f}",
+                mean_loss=f"{mean_loss:.4f}",
+                type=f"{mean_components.get('type_loss', 0.0):.4f}",
+                patch=f"{mean_components.get('patch_loss', 0.0):.4f}",
+                region=f"{mean_components.get('region_loss', 0.0):.4f}",
+                targets=metrics["num_targets"],
+                skipped=skipped_missing,
+            )
 
             if log_every > 0 and global_step % log_every == 0:
-                mean_loss = loss_total / max(1, trained_examples)
-                print(
+                tqdm.write(
                     f"step={global_step} epoch={epoch + 1}/{num_epochs} "
                     f"loss={loss_value:.4f} mean_loss={mean_loss:.4f} "
+                    f"type_loss={mean_components.get('type_loss', 0.0):.4f} "
+                    f"patch_loss={mean_components.get('patch_loss', 0.0):.4f} "
+                    f"region_loss={mean_components.get('region_loss', 0.0):.4f} "
                     f"targets={metrics['num_targets']} "
                     f"initial_visual={metrics['initial_visual_mode']} example_id={example_id}"
                 )
@@ -144,6 +203,9 @@ def main() -> None:
                 "trained_examples": trained_examples,
                 "skipped_missing_examples": skipped_missing,
                 "mean_loss": loss_total / max(1, trained_examples),
+                "loss_components": finalize_weighted_means(loss_component_totals, loss_component_counts),
+                "action_loss_means": finalize_weighted_means(action_loss_totals, action_loss_counts),
+                "logit_stats": finalize_weighted_means(logit_stat_totals, logit_stat_counts),
                 "action_counts": dict(action_totals),
                 "initial_visual_counts": dict(initial_visual_totals),
                 "full_context_probability": full_context_probability,
@@ -154,7 +216,7 @@ def main() -> None:
             }
             epoch_checkpoint_path = output_dir / f"controller_sft_epoch_{epoch + 1}.pt"
             save_controller_sft_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
-            print(f"Saved Phase 3 epoch checkpoint to {epoch_checkpoint_path}")
+            tqdm.write(f"Saved Phase 3 epoch checkpoint to {epoch_checkpoint_path}")
 
     if trained_examples == 0:
         raise ValueError(
@@ -169,6 +231,9 @@ def main() -> None:
         "trained_examples": trained_examples,
         "skipped_missing_examples": skipped_missing,
         "mean_loss": loss_total / max(1, trained_examples),
+        "loss_components": finalize_weighted_means(loss_component_totals, loss_component_counts),
+        "action_loss_means": finalize_weighted_means(action_loss_totals, action_loss_counts),
+        "logit_stats": finalize_weighted_means(logit_stat_totals, logit_stat_counts),
         "action_counts": dict(action_totals),
         "initial_visual_counts": dict(initial_visual_totals),
         "full_context_probability": full_context_probability,

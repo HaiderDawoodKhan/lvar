@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from lvar.controller_sft import set_controller_sft_trainable
-from lvar.qwen_lvar import QwenLVAR
+from lvar.qwen_lvar import ControllerHead, QwenLVAR
 from lvar.utils import (
     ACTION_GLOBAL,
     ACTION_PATCH,
@@ -630,6 +630,27 @@ class QwenLVARTests(unittest.TestCase):
         self.assertFalse(any(name.startswith("global_pool.") for name in trainable_names))
         self.assertFalse(any(name.startswith("region_pool.") for name in trainable_names))
         self.assertFalse(any(name.startswith("backbone.") for name in trainable_names))
+
+    def test_controller_index_logits_are_normalized_and_finite(self):
+        head = ControllerHead(
+            hidden_size=4,
+            num_actions=5,
+            controller_num_states=1,
+            index_temperature=0.07,
+        )
+        state_hidden = torch.randn(1, 4) * 1000.0
+        step_hidden = torch.randn(1, 4) * 1000.0
+        bank = {
+            "regions": torch.randn(3, 4) * 1000.0,
+            "patches": torch.randn(4, 4) * 1000.0,
+        }
+
+        _, region_logits, patch_logits = head(state_hidden, step_hidden, bank)
+
+        self.assertTrue(torch.isfinite(region_logits).all())
+        self.assertTrue(torch.isfinite(patch_logits).all())
+        self.assertLessEqual(float(region_logits.abs().max()), (1.0 / 0.07) + 1e-5)
+        self.assertLessEqual(float(patch_logits.abs().max()), (1.0 / 0.07) + 1e-5)
 
     def test_region_inserts_raw_patches(self):
         model = build_model(controller_context_window=1, region_window=2)

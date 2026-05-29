@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from lvar.utils import (
@@ -38,6 +39,7 @@ class ControllerHead(nn.Module):
         num_actions: int,
         use_control_tokens: bool = False,
         controller_num_states: int = 1,
+        index_temperature: float = 0.07,
     ) -> None:
         """
         Args:
@@ -46,6 +48,7 @@ class ControllerHead(nn.Module):
             use_control_tokens: Whether latent/act control tokens are enabled.
             controller_num_states: Number of hidden-state positions read by the
                 controller in tokenless mode.
+            index_temperature: Temperature for normalized region/patch similarities.
 
         Attributes:
             fuse: MLP combining controller state embeddings.
@@ -55,6 +58,9 @@ class ControllerHead(nn.Module):
         """
         super().__init__()
         self.use_control_tokens = use_control_tokens
+        self.index_temperature = float(index_temperature)
+        if self.index_temperature <= 0.0:
+            raise ValueError("index_temperature must be greater than 0.")
         input_factor = 3 if use_control_tokens else controller_num_states + 1
         self.fuse = nn.Sequential(
             nn.Linear(hidden_size * input_factor, hidden_size),
@@ -89,12 +95,14 @@ class ControllerHead(nn.Module):
         region_bank = bank["regions"].unsqueeze(0).expand(batch_size, -1, -1)
         patch_bank = bank["patches"].unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Score visual candidates with simple query-dot-bank products.
-        region_query = self.region_query(controller_hidden).unsqueeze(-1)
-        patch_query = self.patch_query(controller_hidden).unsqueeze(-1)
+        # Score visual candidates with normalized similarities so CE scale stays bounded.
+        region_query = F.normalize(self.region_query(controller_hidden), dim=-1).unsqueeze(-1)
+        patch_query = F.normalize(self.patch_query(controller_hidden), dim=-1).unsqueeze(-1)
+        region_bank = F.normalize(region_bank, dim=-1)
+        patch_bank = F.normalize(patch_bank, dim=-1)
 
-        region_logits = torch.bmm(region_bank, region_query).squeeze(-1)
-        patch_logits = torch.bmm(patch_bank, patch_query).squeeze(-1)
+        region_logits = torch.bmm(region_bank, region_query).squeeze(-1) / self.index_temperature
+        patch_logits = torch.bmm(patch_bank, patch_query).squeeze(-1) / self.index_temperature
         return type_logits, region_logits, patch_logits
 
 
@@ -137,6 +145,7 @@ class QwenLVAR(nn.Module):
         self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
         self.action_selection = cfg.get("action_selection", "argmax")
         self.controller_temperature = float(cfg.get("controller_temperature", 1.0))
+        self.controller_index_temperature = float(cfg.get("controller_index_temperature", 0.07))
         self.pooling = self._resolve_pooling(cfg.get("pooling", "mean"))
         self.use_control_tokens = bool(cfg.get("use_control_tokens", False))
         self.think_append_hidden = bool(cfg.get("think_append_hidden", True))
@@ -147,6 +156,8 @@ class QwenLVAR(nn.Module):
 
         if self.controller_temperature <= 0.0:
             raise ValueError("controller_temperature must be greater than 0.")
+        if self.controller_index_temperature <= 0.0:
+            raise ValueError("controller_index_temperature must be greater than 0.")
         if self.controller_num_states <= 0:
             raise ValueError("controller_context_window must be greater than 0.")
         if self.controller_max_steps <= 0:
@@ -197,6 +208,7 @@ class QwenLVAR(nn.Module):
             len(ACTION_NAMES),
             use_control_tokens=self.use_control_tokens,
             controller_num_states=self.controller_num_states,
+            index_temperature=self.controller_index_temperature,
         )
         self.step_embedding = nn.Embedding(self.controller_max_steps, self.hidden_size)
 

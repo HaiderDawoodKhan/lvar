@@ -6,7 +6,8 @@ model:
   region_window: 2
   max_answer_tokens: 32
   action_selection: sample
-  controller_temperature: 3.0
+  controller_temperature: 1.0
+  controller_index_temperature: 0.07
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
@@ -37,14 +38,14 @@ phase3:
   seed: 42
   trace_path: outputs/phase2_m3cot_traces.jsonl
   output_dir: outputs/controller_sft_m3cot
-  learning_rate: 0.0002
+  learning_rate: 0.00005
   weight_decay: 0.0
   num_epochs: 3
   max_examples:
   grad_clip_norm: 1.0
   log_every: 10
   image_size: 280
-  controller_max_steps: 20
+  controller_max_steps: 32
   full_context_probability: 0.1
 
 phase4:
@@ -60,7 +61,7 @@ phase4:
   grad_clip_norm: 1.0
   log_every: 10
   image_size: 280
-  controller_max_steps: 20
+  controller_max_steps: 32
   context_full_probability: 0.2
   negative_type_probs:
     same_image_wrong: 0.5
@@ -85,8 +86,8 @@ phase5:
   grad_clip_norm: 1.0
   log_every: 10
   image_size: 280
-  controller_max_steps: 20
-  max_controller_steps: 20
+  controller_max_steps: 32
+  max_controller_steps: 32
   rollout_temperature: 1.5
   clip_epsilon: 0.2
   logp_weight: 0.2

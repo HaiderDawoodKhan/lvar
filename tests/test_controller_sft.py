@@ -90,6 +90,17 @@ class ControllerSFTTests(unittest.TestCase):
                 expected = F.cross_entropy(type_logits, torch.tensor([action_id]))
                 self.assertTrue(torch.allclose(loss, expected))
 
+                component_loss, components = compute_action_loss(
+                    type_logits,
+                    region_logits,
+                    patch_logits,
+                    {"type": action_type},
+                    return_components=True,
+                )
+                self.assertTrue(torch.allclose(component_loss, expected))
+                self.assertTrue(torch.allclose(components["type_loss"], expected))
+                self.assertEqual(components["action_type"], action_type)
+
     def test_patch_and_region_losses_include_index_heads(self):
         type_logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]])
         region_logits = torch.tensor([[0.0, 2.0, -1.0]])
@@ -131,7 +142,29 @@ class ControllerSFTTests(unittest.TestCase):
         self.assertEqual(metrics["num_targets"], 4)
         self.assertEqual(metrics["skipped_noop_decisions"], 1)
         self.assertEqual(metrics["action_counts"]["STOP"], 1)
+        self.assertIn("type_loss", metrics["loss_components"])
+        self.assertIn("patch_loss", metrics["loss_components"])
+        self.assertIn("region_loss", metrics["loss_components"])
+        self.assertIn("PATCH", metrics["action_loss_means"])
+        self.assertIn("type_logits_max", metrics["logit_stats"])
+        self.assertIn("patch_logits_mean", metrics["logit_stats"])
         self.assertEqual(metrics["initial_visual_mode"], "global_mean")
+
+    def test_replay_supports_31_actions_plus_stop_step(self):
+        model = TinyReplayModel()
+        mined_row = {
+            "example_id": "ex-1",
+            "question": "formatted question",
+            "decisions": [{"selected": "THINK", "actions": [{"type": "THINK"}]} for _ in range(31)],
+        }
+        source_example = {"id": "ex-1", "image": "image", "question": "source question"}
+
+        loss, metrics = replay_controller_sft_loss(model, mined_row, source_example, image_size=280)
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(model.seen_steps, list(range(32)))
+        self.assertEqual(metrics["num_targets"], 32)
+        self.assertEqual(metrics["num_controller_steps"], 32)
 
     def test_replay_can_start_from_full_context_by_probability(self):
         model = TinyReplayModel()

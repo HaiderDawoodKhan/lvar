@@ -74,23 +74,53 @@ def compute_action_loss(
     region_logits: torch.Tensor,
     patch_logits: torch.Tensor,
     action: Dict[str, Any],
-) -> torch.Tensor:
+    return_components: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor | str]]:
     """Compute controller SFT loss for one primitive action."""
     name = action_type(action)
     device = type_logits.device
     target_type = torch.tensor([ACTION_NAME_TO_ID[name]], device=device, dtype=torch.long)
-    loss = F.cross_entropy(type_logits, target_type)
+    type_loss = F.cross_entropy(type_logits, target_type)
+    patch_loss = torch.zeros((), device=device, dtype=type_loss.dtype)
+    region_loss = torch.zeros((), device=device, dtype=type_loss.dtype)
+    loss = type_loss
 
     if name == "PATCH":
         patch_idx = int(action["patch_idx"])
         target_patch = torch.tensor([patch_idx], device=device, dtype=torch.long)
-        loss = loss + F.cross_entropy(patch_logits, target_patch)
+        patch_loss = F.cross_entropy(patch_logits, target_patch)
+        loss = loss + patch_loss
     elif name == "REGION":
         region_idx = int(action["region_idx"])
         target_region = torch.tensor([region_idx], device=device, dtype=torch.long)
-        loss = loss + F.cross_entropy(region_logits, target_region)
+        region_loss = F.cross_entropy(region_logits, target_region)
+        loss = loss + region_loss
 
+    if return_components:
+        return loss, {
+            "action_type": name,
+            "total_loss": loss,
+            "type_loss": type_loss,
+            "patch_loss": patch_loss,
+            "region_loss": region_loss,
+        }
     return loss
+
+
+def _update_logit_stats(prefix: str, logits: torch.Tensor, totals: Dict[str, float], counts: Dict[str, int]) -> None:
+    detached = logits.detach().float()
+    for stat_name, value in {
+        "min": detached.min().item(),
+        "max": detached.max().item(),
+        "mean": detached.mean().item(),
+    }.items():
+        key = f"{prefix}_{stat_name}"
+        totals[key] = totals.get(key, 0.0) + float(value)
+        counts[key] = counts.get(key, 0) + 1
+
+
+def _mean_dict(totals: Dict[str, float], counts: Dict[str, int]) -> Dict[str, float]:
+    return {key: totals[key] / max(1, counts.get(key, 0)) for key in totals}
 
 
 def set_controller_sft_trainable(model: torch.nn.Module) -> List[torch.nn.Parameter]:
@@ -183,8 +213,36 @@ def replay_controller_sft_loss(
     )
     losses: List[torch.Tensor] = []
     action_counts: Counter[str] = Counter()
+    component_loss_totals: Dict[str, float] = {}
+    component_loss_counts: Dict[str, int] = {}
+    action_loss_totals: Dict[str, float] = {}
+    action_loss_counts: Dict[str, int] = {}
+    logit_stat_totals: Dict[str, float] = {}
+    logit_stat_counts: Dict[str, int] = {}
     skipped_noop = 0
     controller_step = 0
+
+    def record_step_metrics(
+        type_logits: torch.Tensor,
+        region_logits: torch.Tensor,
+        patch_logits: torch.Tensor,
+        components: Dict[str, torch.Tensor | str],
+    ) -> None:
+        _update_logit_stats("type_logits", type_logits, logit_stat_totals, logit_stat_counts)
+        _update_logit_stats("region_logits", region_logits, logit_stat_totals, logit_stat_counts)
+        _update_logit_stats("patch_logits", patch_logits, logit_stat_totals, logit_stat_counts)
+        action_name = str(components["action_type"])
+        total_value = float(components["total_loss"].detach().item())  # type: ignore[union-attr]
+        action_loss_totals[action_name] = action_loss_totals.get(action_name, 0.0) + total_value
+        action_loss_counts[action_name] = action_loss_counts.get(action_name, 0) + 1
+        for key in ("total_loss", "type_loss", "patch_loss", "region_loss"):
+            value = components[key]
+            if not isinstance(value, torch.Tensor):
+                continue
+            if key in {"patch_loss", "region_loss"} and float(value.detach().item()) == 0.0:
+                continue
+            component_loss_totals[key] = component_loss_totals.get(key, 0.0) + float(value.detach().item())
+            component_loss_counts[key] = component_loss_counts.get(key, 0) + 1
 
     for decision in mined_row.get("decisions", []):
         actions = decision.get("actions") or []
@@ -198,8 +256,16 @@ def replay_controller_sft_loss(
                 bank,
                 controller_step,
             )
-            losses.append(compute_action_loss(type_logits, region_logits, patch_logits, action))
-            action_counts[action_type(action)] += 1
+            loss, components = compute_action_loss(
+                type_logits,
+                region_logits,
+                patch_logits,
+                action,
+                return_components=True,
+            )
+            losses.append(loss)
+            action_counts[str(components["action_type"])] += 1
+            record_step_metrics(type_logits, region_logits, patch_logits, components)
             with torch.no_grad():
                 model.apply_mined_actions(state, bank, [action])
             controller_step += 1
@@ -210,8 +276,16 @@ def replay_controller_sft_loss(
         bank,
         controller_step,
     )
-    losses.append(compute_action_loss(type_logits, region_logits, patch_logits, stop_action))
+    stop_loss, stop_components = compute_action_loss(
+        type_logits,
+        region_logits,
+        patch_logits,
+        stop_action,
+        return_components=True,
+    )
+    losses.append(stop_loss)
     action_counts["STOP"] += 1
+    record_step_metrics(type_logits, region_logits, patch_logits, stop_components)
 
     metrics = {
         "example_id": mined_row.get("example_id"),
@@ -219,6 +293,12 @@ def replay_controller_sft_loss(
         "num_controller_steps": controller_step + 1,
         "skipped_noop_decisions": skipped_noop,
         "action_counts": dict(action_counts),
+        "loss_components": _mean_dict(component_loss_totals, component_loss_counts),
+        "loss_component_counts": dict(component_loss_counts),
+        "action_loss_means": _mean_dict(action_loss_totals, action_loss_counts),
+        "action_loss_counts": dict(action_loss_counts),
+        "logit_stats": _mean_dict(logit_stat_totals, logit_stat_counts),
+        "logit_stat_counts": dict(logit_stat_counts),
         "initial_visual_mode": "full_context" if use_full_context else "global_mean",
         "used_full_context": use_full_context,
     }
