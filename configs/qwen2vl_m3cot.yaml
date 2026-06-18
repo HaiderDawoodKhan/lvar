@@ -2,18 +2,21 @@ model:
   model_id: Qwen/Qwen2-VL-2B-Instruct
   device: auto
   dtype: auto
-  max_steps: 8
+  max_steps: 32
   region_window: 2
   max_answer_tokens: 32
   action_selection: sample
   controller_temperature: 1.0
   controller_index_temperature: 0.07
+  controller_num_regions: 25
+  controller_num_patches: 100
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
   controller_context_window: 3
   use_checkpoint: true
-  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
+  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
 
 dataset:
   type: m3cot
@@ -38,46 +41,70 @@ phase3:
   seed: 42
   trace_path: outputs/phase2_m3cot_traces.jsonl
   output_dir: outputs/controller_sft_m3cot
-  learning_rate: 0.00005
-  weight_decay: 0.0
-  num_epochs: 3
-  max_examples:
-  grad_clip_norm: 1.0
-  log_every: 10
-  image_size: 280
-  controller_max_steps: 32
-  full_context_probability: 0.1
-
-phase4:
-  seed: 42
-  trace_path: outputs/phase2_m3cot_traces.jsonl
-  controller_checkpoint_path: outputs/controller_sft_m3cot/controller_sft.pt
-  output_dir: outputs/counterfactual_m3cot
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/counterfactual_m3cot/counterfactual_epoch_3.pt"
+  phase3_v2: true
   controller_lr: 0.0001
-  lora_lr: 0.00002
-  train_controller: false
-  controller_loss_weight: 0.0
+  learning_rate: 0.0001
   weight_decay: 0.0
-  num_epochs: 3
-  max_pairs:
+  num_epochs: 6
+  max_examples:
   grad_clip_norm: 1.0
   log_every: 100
   image_size: 280
   controller_max_steps: 32
-  context_full_probability: 0.2
+  full_context_probability: 0.25
+  remove_global: true
+  mask_immediate_repeats: true
+  decision_block_normalized: true
+  visual_or_region_min_improvement: 0.04
+  think_min_improvement: 0.03
+  max_decision_blocks_per_example: 6
+  max_primitive_actions_per_example: 8
+  no_op_stop_ce_threshold: 0.05
+  visual_block_dropout_p: 0.05
+  type_loss_weights:
+    PATCH: 1.0
+    REGION: 2.5
+    THINK: 5.0
+    STOP: 5.0
+
+phase4:
+  seed: 42
+  training_mode: positive_ce_gold
+  trace_path: outputs/phase2_m3cot_traces.jsonl
+  controller_checkpoint_path: outputs/controller_sft_m3cot/controller_sft.pt
+  output_dir: outputs/traces_m3cot
+  controller_lr: 0.0001
+  lora_lr: 0.00002
+  train_controller: false
+  controller_loss_weight: 0.0
+  positive_ce_gold_probability: 0.4
+  max_controller_steps: 32
+  sample_controller_actions: false
+  weight_decay: 0.0
+  num_epochs: 2
+  max_pairs:
+  grad_clip_norm: 1.0
+  log_every: 10
+  image_size: 280
+  controller_max_steps: 32
+  context_full_probability: 0.25
   negative_type_probs:
-    same_image_wrong: 0.7
-    different_image_random: 0.3
-    same_image_noisy: 0.0
+    same_image_wrong: 0.5
+    different_image_random: 0.35
+    same_image_noisy: 0.15
   rank_margin: 0.1
-  positive_ce_weight: 0.5
-  rank_weight: 0.35
+  positive_ce_weight: 0.2
+  rank_weight: 0.3
+  rank_target: answer
   noise_scale: 0.5
 
 phase5:
   seed: 42
   dataset_partition: validation
-  phase4_checkpoint_path: outputs/counterfactual_m3cot/counterfactual.pt
+  phase4_vlm_checkpoint_path: None
+  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
+  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   output_dir: outputs/grpo_phase5_m3cot
   controller_lr: 0.00005
   weight_decay: 0.0
@@ -86,17 +113,22 @@ phase5:
   group_size: 6
   update_epochs: 1
   grad_clip_norm: 1.0
-  log_every: 10
+  log_every: 1
   image_size: 280
   controller_max_steps: 32
   max_controller_steps: 32
   rollout_temperature: 1.5
   clip_epsilon: 0.2
-  logp_weight: 0.2
+  logp_weight: 0.05
   counterfactual_weight: 0.3
   use_counterfactual_reward: true
   cf_random_image_probability: 0.35
   no_stop_penalty: 0.2
+  no_visual_penalty: 0.3
+  early_stop_penalty: 0.3
+  min_controller_actions_before_stop: 3
+  min_visual_actions_before_stop: 1
+  think_once_bonus: 0.1
   advantage_epsilon: 0.000001
   improve_weight: 1.5
   miss_weight: 1.0
@@ -118,8 +150,9 @@ inference:
   limit:
   output_path: outputs/m3cot_lvar_predictions.jsonl
   dataset_partition: test
-  controller_checkpoint_path: ""
+  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   action_selection: argmax
+  mask_immediate_repeats: true
 
 debug:
   index: 0

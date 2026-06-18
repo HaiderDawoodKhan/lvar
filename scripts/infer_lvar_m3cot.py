@@ -1,7 +1,6 @@
 import argparse
 import json
 import logging
-import re
 import sys
 from pathlib import Path
 
@@ -14,9 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lvar.dataset import build_dataset
-from lvar.grpo_training import load_trainable_checkpoint
+from lvar.grpo_training import load_controller_checkpoint, load_vlm_lora_checkpoint
 from lvar.qwen_lvar import QwenLVAR
-from lvar.utils import add_model_loading_args, apply_model_loading_overrides
+from lvar.rewards import verify_choice_output
+from lvar.utils import ACTION_NAMES_NO_GLOBAL, add_model_loading_args, apply_model_loading_overrides
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -41,36 +41,7 @@ def write_json(path: Path, data):
 
 
 def verify_output(generated_text: str, gold_answer: str) -> bool:
-    cleaned_text = re.sub(
-        r"(?<=answer:)\s*(\n+\s*)?assistant\b",
-        "",
-        generated_text,
-        flags=re.IGNORECASE,
-    )
-    letter_matches = re.finditer(
-        r"(?:the\s+answer\s+is|Answer:)\s*[\n\s]*([A-Z])",
-        cleaned_text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    candidates = {match.group(1).upper() for match in letter_matches}
-
-    digit_matches = re.finditer(
-        r"(?:the\s+answer\s+is|Answer:)\s*[\n\s]*(\d)",
-        cleaned_text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    for match in digit_matches:
-        digit = int(match.group(1))
-        if 0 <= digit <= 3:
-            candidates.add(chr(ord("A") + digit))
-
-    gt_answer = gold_answer.strip().upper()
-    if gt_answer.isdigit():
-        digit = int(gt_answer)
-        if 0 <= digit <= 3:
-            gt_answer = chr(ord("A") + digit)
-
-    return gt_answer in candidates
+    return verify_choice_output(generated_text, gold_answer)
 
 
 def compute_controller_tokens(trace: list) -> int:
@@ -87,6 +58,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--phase4-vlm-checkpoint-path", default=None)
     parser.add_argument("--controller-checkpoint-path", default=None)
     parser.add_argument("--use-coarse-context", action="store_true", default=False)
     add_model_loading_args(parser)
@@ -100,6 +72,10 @@ def main() -> None:
 
     if "action_selection" in inference_cfg:
         config["model"]["action_selection"] = inference_cfg["action_selection"]
+    if bool(config.get("phase3", {}).get("phase3_v2", False)) or bool(config.get("phase3", {}).get("remove_global", False)):
+        config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
+    if "mask_immediate_repeats" in inference_cfg:
+        config["model"]["mask_immediate_repeats"] = bool(inference_cfg["mask_immediate_repeats"])
 
     dataset_partition = inference_cfg.get("dataset_partition", "test")
     split_seed = int(inference_cfg.get("split_seed", dataset_cfg.get("split_seed", train_cfg.get("seed", 42))))
@@ -114,17 +90,31 @@ def main() -> None:
 
     model = QwenLVAR(config["model"])
 
+    phase4_vlm_checkpoint_path = args.phase4_vlm_checkpoint_path or inference_cfg.get(
+        "phase4_vlm_checkpoint_path",
+        config.get("phase5", {}).get("phase4_vlm_checkpoint_path", ""),
+    )
+    if phase4_vlm_checkpoint_path:
+        loaded = load_vlm_lora_checkpoint(model, phase4_vlm_checkpoint_path)
+        if loaded:
+            print(f"Loaded Phase 4 VLM LoRA checkpoint: {phase4_vlm_checkpoint_path}")
+        else:
+            print(f"Phase 4 VLM LoRA checkpoint not found: {phase4_vlm_checkpoint_path}")
+
     controller_checkpoint_path = args.controller_checkpoint_path or inference_cfg.get(
-        "controller_checkpoint_path", ""
+        "controller_checkpoint_path",
+        config.get("phase5", {}).get("controller_checkpoint_path", ""),
     )
     if controller_checkpoint_path:
-        loaded = load_trainable_checkpoint(model, controller_checkpoint_path)
+        loaded = load_controller_checkpoint(model, controller_checkpoint_path)
         if loaded:
             print(f"Loaded controller checkpoint: {controller_checkpoint_path}")
         else:
             print(f"Controller checkpoint not found: {controller_checkpoint_path}")
 
     model.eval()
+    image_size = inference_cfg.get("image_size", config.get("phase2", {}).get("image_size", 280))
+    print(f"Using inference image size: {image_size}x{image_size}")
     rows = []
     total = 0
     correct = 0
@@ -140,6 +130,7 @@ def main() -> None:
                 questions=example["question"],
                 add_answer_instruction=False,
                 use_coarse_context=args.use_coarse_context,
+                image_size=image_size,
             )
 
         generated_text = output["generated_text"]
@@ -204,6 +195,7 @@ def main() -> None:
         "dataset_partition": dataset_partition,
         "num_examples": total,
         "coarse_context": args.use_coarse_context,
+        "phase4_vlm_checkpoint": phase4_vlm_checkpoint_path,
         "controller_checkpoint": controller_checkpoint_path,
         "metrics": {
             "total": total,

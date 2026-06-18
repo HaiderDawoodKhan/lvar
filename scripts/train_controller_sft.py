@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lvar.controller_sft import (
+    PHASE3_V2_TYPE_LOSS_WEIGHTS,
     build_example_index,
     load_mined_trace_rows,
     replay_controller_sft_loss,
@@ -23,8 +24,9 @@ from lvar.controller_sft import (
     set_seed,
 )
 from lvar.dataset import build_dataset
+from lvar.grpo_training import load_vlm_lora_checkpoint
 from lvar.qwen_lvar import QwenLVAR
-from lvar.utils import ACTION_NAMES, add_model_loading_args, apply_model_loading_overrides
+from lvar.utils import ACTION_NAMES_NO_GLOBAL, add_model_loading_args, apply_model_loading_overrides
 
 
 def load_config(config_path: str):
@@ -66,6 +68,10 @@ def main() -> None:
 
     if "controller_max_steps" in phase3_cfg:
         model_cfg["controller_max_steps"] = int(phase3_cfg["controller_max_steps"])
+    phase3_v2 = bool(phase3_cfg.get("phase3_v2", phase3_cfg.get("remove_global", False)))
+    if phase3_v2:
+        model_cfg["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
+        model_cfg["mask_immediate_repeats"] = bool(phase3_cfg.get("mask_immediate_repeats", True))
 
     seed = int(args.seed if args.seed is not None else phase3_cfg.get("seed", config.get("train", {}).get("seed", 42)))
     set_seed(seed)
@@ -86,6 +92,15 @@ def main() -> None:
     example_index = build_example_index(dataset)
 
     model = QwenLVAR(model_cfg)
+    phase4_vlm_checkpoint_path = phase3_cfg.get("phase4_vlm_checkpoint_path")
+    loaded_phase4_vlm = False
+    if phase4_vlm_checkpoint_path:
+        loaded_phase4_vlm = load_vlm_lora_checkpoint(model, phase4_vlm_checkpoint_path)
+        print(
+            f"Loaded Phase 4 VLM LoRA checkpoint: {phase4_vlm_checkpoint_path}"
+            if loaded_phase4_vlm
+            else f"Phase 4 VLM LoRA checkpoint not found: {phase4_vlm_checkpoint_path}"
+        )
     model.train()
     trainable_params = set_controller_sft_trainable(model)
     if not trainable_params:
@@ -93,7 +108,7 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(
         trainable_params,
-        lr=float(phase3_cfg.get("learning_rate", 1e-4)),
+        lr=float(phase3_cfg.get("controller_lr", phase3_cfg.get("learning_rate", 1e-4))),
         weight_decay=float(phase3_cfg.get("weight_decay", 0.0)),
     )
 
@@ -104,6 +119,16 @@ def main() -> None:
     full_context_probability = float(phase3_cfg.get("full_context_probability", 0.1))
     if full_context_probability < 0.0 or full_context_probability > 1.0:
         raise ValueError("phase3.full_context_probability must be in [0, 1].")
+    decision_block_normalized = bool(phase3_cfg.get("decision_block_normalized", phase3_v2))
+    type_loss_weights = dict(PHASE3_V2_TYPE_LOSS_WEIGHTS if phase3_v2 else {})
+    type_loss_weights.update(phase3_cfg.get("type_loss_weights", {}) or {})
+    visual_or_region_min_improvement = float(phase3_cfg.get("visual_or_region_min_improvement", 0.05))
+    think_min_improvement = float(phase3_cfg.get("think_min_improvement", 0.03))
+    max_decision_blocks = int(phase3_cfg.get("max_decision_blocks_per_example", 6))
+    max_primitive_actions = int(phase3_cfg.get("max_primitive_actions_per_example", 8))
+    no_op_stop_ce_threshold = float(phase3_cfg.get("no_op_stop_ce_threshold", 0.05))
+    remove_global = bool(phase3_cfg.get("remove_global", phase3_v2))
+    visual_block_dropout_p = float(phase3_cfg.get("visual_block_dropout_p", 0.0))
     context_rng = random.Random(seed)
 
     global_step = 0
@@ -116,6 +141,8 @@ def main() -> None:
     action_loss_counts: Counter[str] = Counter()
     logit_stat_totals: Counter[str] = Counter()
     logit_stat_counts: Counter[str] = Counter()
+    transform_totals: Counter[str] = Counter()
+    skipped_block_totals: Counter[str] = Counter()
     loss_total = 0.0
     trained_examples = 0
 
@@ -141,6 +168,16 @@ def main() -> None:
                 image_size=image_size,
                 full_context_probability=full_context_probability,
                 rng=context_rng,
+                decision_block_normalized=decision_block_normalized,
+                type_loss_weights=type_loss_weights,
+                phase3_v2=phase3_v2,
+                visual_or_region_min_improvement=visual_or_region_min_improvement,
+                think_min_improvement=think_min_improvement,
+                max_decision_blocks_per_example=max_decision_blocks,
+                max_primitive_actions_per_example=max_primitive_actions,
+                no_op_stop_ce_threshold=no_op_stop_ce_threshold,
+                remove_global=remove_global,
+                visual_block_dropout_p=visual_block_dropout_p,
             )
             loss.backward()
             if grad_clip_norm > 0:
@@ -171,6 +208,11 @@ def main() -> None:
                 metrics.get("logit_stats", {}),
                 metrics.get("logit_stat_counts", {}),
             )
+            transform = metrics.get("transform", {}) or {}
+            for key in ("candidate_blocks", "kept_blocks", "kept_non_stop_blocks", "kept_primitives", "converted_noop_to_stop"):
+                transform_totals[key] += int(transform.get(key, 0))
+            transform_totals["dropped_visual_blocks"] += int(metrics.get("dropped_visual_blocks", 0))
+            skipped_block_totals.update(transform.get("skipped_blocks", {}) or {})
             mean_components = finalize_weighted_means(loss_component_totals, loss_component_counts)
             mean_loss = loss_total / max(1, trained_examples)
             progress.set_postfix(
@@ -180,6 +222,7 @@ def main() -> None:
                 patch=f"{mean_components.get('patch_loss', 0.0):.4f}",
                 region=f"{mean_components.get('region_loss', 0.0):.4f}",
                 targets=metrics["num_targets"],
+                kept=transform.get("kept_blocks", 0),
                 skipped=skipped_missing,
             )
 
@@ -190,7 +233,9 @@ def main() -> None:
                     f"type_loss={mean_components.get('type_loss', 0.0):.4f} "
                     f"patch_loss={mean_components.get('patch_loss', 0.0):.4f} "
                     f"region_loss={mean_components.get('region_loss', 0.0):.4f} "
-                    f"targets={metrics['num_targets']} "
+                    f"blocks={metrics['num_targets']} primitives={metrics.get('num_primitive_targets', 0)} "
+                    f"kept_blocks={transform.get('kept_blocks', 0)} "
+                    f"noop_stop={transform.get('converted_noop_to_stop', 0)} "
                     f"initial_visual={metrics['initial_visual_mode']} example_id={example_id}"
                 )
 
@@ -209,7 +254,15 @@ def main() -> None:
                 "action_counts": dict(action_totals),
                 "initial_visual_counts": dict(initial_visual_totals),
                 "full_context_probability": full_context_probability,
-                "action_names": ACTION_NAMES,
+                "loaded_phase4_vlm": loaded_phase4_vlm,
+                "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
+                "phase3_v2": phase3_v2,
+                "decision_block_normalized": decision_block_normalized,
+                "type_loss_weights": type_loss_weights,
+                "visual_block_dropout_p": visual_block_dropout_p,
+                "transform_totals": dict(transform_totals),
+                "skipped_block_totals": dict(skipped_block_totals),
+                "action_names": model.action_names,
                 "controller_context_window": model.controller_num_states,
                 "controller_max_steps": model.step_embedding.num_embeddings,
                 "seed": seed,
@@ -237,7 +290,15 @@ def main() -> None:
         "action_counts": dict(action_totals),
         "initial_visual_counts": dict(initial_visual_totals),
         "full_context_probability": full_context_probability,
-        "action_names": ACTION_NAMES,
+        "loaded_phase4_vlm": loaded_phase4_vlm,
+        "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
+        "phase3_v2": phase3_v2,
+        "decision_block_normalized": decision_block_normalized,
+        "type_loss_weights": type_loss_weights,
+        "visual_block_dropout_p": visual_block_dropout_p,
+        "transform_totals": dict(transform_totals),
+        "skipped_block_totals": dict(skipped_block_totals),
+        "action_names": model.action_names,
         "controller_context_window": model.controller_num_states,
         "controller_max_steps": model.step_embedding.num_embeddings,
         "seed": seed,

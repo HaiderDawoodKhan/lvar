@@ -20,6 +20,7 @@ from lvar.utils import (
     ACTION_REGION,
     ACTION_STOP,
     ACTION_THINK,
+    normalize_action_names,
 )
 
 
@@ -100,7 +101,72 @@ def load_trainable_checkpoint(model: torch.nn.Module, checkpoint_path: str | Pat
         return False
     payload = torch.load(path, map_location="cpu")
     state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    checkpoint_actions = metadata.get("action_names")
+    model_actions = getattr(model, "action_names", ACTION_NAMES)
+    if checkpoint_actions is not None:
+        checkpoint_actions = normalize_action_names(checkpoint_actions)
+        model_actions = normalize_action_names(model_actions)
+        if checkpoint_actions != model_actions:
+            raise ValueError(
+                f"Checkpoint action_names {checkpoint_actions} do not match model action_names {model_actions}."
+            )
     model.load_state_dict(state_dict, strict=False)
+    return True
+
+
+def _load_checkpoint_payload(checkpoint_path: str | Path) -> Optional[Dict[str, Any]]:
+    path = Path(checkpoint_path)
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu")
+    if isinstance(payload, dict):
+        return payload
+    return {"state_dict": payload, "metadata": {}}
+
+
+def _check_action_names(model: torch.nn.Module, metadata: Dict[str, Any]) -> None:
+    checkpoint_actions = metadata.get("action_names")
+    if checkpoint_actions is None:
+        return
+    checkpoint_actions = normalize_action_names(checkpoint_actions)
+    model_actions = normalize_action_names(getattr(model, "action_names", ACTION_NAMES))
+    if checkpoint_actions != model_actions:
+        raise ValueError(
+            f"Checkpoint action_names {checkpoint_actions} do not match model action_names {model_actions}."
+        )
+
+
+def load_vlm_lora_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path) -> bool:
+    """Load only VLM LoRA weights from a Phase 4 checkpoint."""
+    payload = _load_checkpoint_payload(checkpoint_path)
+    if payload is None:
+        return False
+    state_dict = payload.get("state_dict", payload)
+    lora_state = {name: tensor for name, tensor in state_dict.items() if "lora_" in name}
+    if not lora_state:
+        raise ValueError(f"No LoRA weights found in VLM checkpoint: {checkpoint_path}")
+    model.load_state_dict(lora_state, strict=False)
+    return True
+
+
+def load_controller_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path) -> bool:
+    """Load only controller-facing weights from a controller checkpoint."""
+    payload = _load_checkpoint_payload(checkpoint_path)
+    if payload is None:
+        return False
+    metadata = payload.get("metadata", {})
+    _check_action_names(model, metadata)
+    state_dict = payload.get("state_dict", payload)
+    controller_prefixes = ("controller.", "step_embedding.", "controller_state_norm.")
+    controller_state = {
+        name: tensor
+        for name, tensor in state_dict.items()
+        if name.startswith(controller_prefixes)
+    }
+    if not controller_state:
+        raise ValueError(f"No controller weights found in controller checkpoint: {checkpoint_path}")
+    model.load_state_dict(controller_state, strict=False)
     return True
 
 
@@ -120,17 +186,48 @@ def _masked_patch_logits(patch_logits: torch.Tensor, selected_patches: set[int])
     return masked
 
 
+def _masked_stop_logits(
+    type_logits: torch.Tensor,
+    model: torch.nn.Module,
+    step_idx: int,
+    selected_visual_count: int,
+    min_controller_actions_before_stop: int = 0,
+    min_visual_actions_before_stop: int = 0,
+) -> torch.Tensor:
+    """Mask STOP until the rollout has enough actions/visual evidence."""
+    should_mask_stop = (
+        step_idx < int(min_controller_actions_before_stop)
+        or selected_visual_count < int(min_visual_actions_before_stop)
+    )
+    if not should_mask_stop:
+        return type_logits
+    action_name_to_id = getattr(model, "action_name_to_id", {name: idx for idx, name in ACTION_NAMES.items()})
+    stop_id = action_name_to_id.get("STOP")
+    if stop_id is None or type_logits.size(-1) <= 1:
+        return type_logits
+    masked = type_logits.clone()
+    masked[:, int(stop_id)] = torch.finfo(masked.dtype).min
+    return masked
+
+
 def _sample_from_logits(logits: torch.Tensor, sample: bool = True) -> Tuple[int, torch.Tensor]:
     distribution = Categorical(logits=logits)
     tensor = distribution.sample() if sample else torch.argmax(logits, dim=-1)
     return int(tensor.item()), distribution.log_prob(tensor).squeeze(0)
 
 
-def _action_from_selection(action_id: int, region_idx: Optional[int] = None, patch_idx: Optional[int] = None) -> Dict[str, Any]:
-    action = {"type": ACTION_NAMES[action_id]}
-    if action_id == ACTION_REGION:
+def _action_from_selection(
+    action_id: int,
+    action_names: Optional[Dict[int, str]] = None,
+    region_idx: Optional[int] = None,
+    patch_idx: Optional[int] = None,
+) -> Dict[str, Any]:
+    names = action_names or ACTION_NAMES
+    action_name = names[action_id]
+    action = {"type": action_name}
+    if action_name == "REGION":
         action["region_idx"] = int(region_idx)
-    elif action_id == ACTION_PATCH:
+    elif action_name == "PATCH":
         action["patch_idx"] = int(patch_idx)
     return action
 
@@ -158,23 +255,35 @@ def select_controller_action(
     step_idx: int,
     temperature: float,
     selected_patches: set[int],
+    selected_visual_count: int = 0,
+    min_controller_actions_before_stop: int = 0,
+    min_visual_actions_before_stop: int = 0,
     sample: bool = True,
 ) -> Tuple[Dict[str, Any], torch.Tensor, Dict[str, torch.Tensor]]:
     """Select one controller action with optional patch masking."""
     type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
+    type_logits = _masked_stop_logits(
+        type_logits,
+        model,
+        step_idx,
+        selected_visual_count,
+        min_controller_actions_before_stop=min_controller_actions_before_stop,
+        min_visual_actions_before_stop=min_visual_actions_before_stop,
+    )
     scaled_type = _scaled_logits(type_logits, temperature)
     scaled_region = _scaled_logits(region_logits, temperature)
     scaled_patch = _scaled_logits(_masked_patch_logits(patch_logits, selected_patches), temperature)
     action_id, log_prob = _sample_from_logits(scaled_type, sample=sample)
+    action_name = getattr(model, "action_names", ACTION_NAMES)[action_id]
     region_idx = None
     patch_idx = None
-    if action_id == ACTION_REGION:
+    if action_name == "REGION":
         region_idx, region_log_prob = _sample_from_logits(scaled_region, sample=sample)
         log_prob = log_prob + region_log_prob
-    elif action_id == ACTION_PATCH:
+    elif action_name == "PATCH":
         patch_idx, patch_log_prob = _sample_from_logits(scaled_patch, sample=sample)
         log_prob = log_prob + patch_log_prob
-    return _action_from_selection(action_id, region_idx, patch_idx), log_prob, {
+    return _action_from_selection(action_id, getattr(model, "action_names", ACTION_NAMES), region_idx, patch_idx), log_prob, {
         "type_logits": scaled_type,
         "region_logits": scaled_region,
         "patch_logits": scaled_patch,
@@ -188,6 +297,8 @@ def rollout_phase5(
     max_controller_steps: int = 20,
     temperature: float = 1.5,
     image_size: Optional[int] = None,
+    min_controller_actions_before_stop: int = 0,
+    min_visual_actions_before_stop: int = 0,
 ) -> Dict[str, Any]:
     """Collect one stochastic Phase 5 rollout from full image context."""
     state, bank = prepare_full_context_state_and_bank(model, image, question, image_size=image_size)
@@ -195,6 +306,7 @@ def rollout_phase5(
     old_log_probs: List[torch.Tensor] = []
     selected_patches: set[int] = set()
     selected_visual_actions: List[Dict[str, Any]] = []
+    selected_visual_count = 0
     stopped = False
 
     for step_idx in range(max_controller_steps):
@@ -206,6 +318,9 @@ def rollout_phase5(
                 step_idx,
                 temperature,
                 selected_patches,
+                selected_visual_count=selected_visual_count,
+                min_controller_actions_before_stop=min_controller_actions_before_stop,
+                min_visual_actions_before_stop=min_visual_actions_before_stop,
                 sample=True,
             )
         action_type = action["type"]
@@ -214,8 +329,10 @@ def rollout_phase5(
         if action_type == "PATCH":
             selected_patches.add(int(action["patch_idx"]))
             selected_visual_actions.append(copy.deepcopy(action))
+            selected_visual_count += 1
         elif action_type in {"REGION", "GLOBAL"}:
             selected_visual_actions.append(copy.deepcopy(action))
+            selected_visual_count += 1
         if action_type == "STOP":
             stopped = True
             break
@@ -249,18 +366,31 @@ def action_log_prob_for_replay(
     step_idx: int,
     temperature: float,
     selected_patches: set[int],
+    selected_visual_count: int = 0,
+    min_controller_actions_before_stop: int = 0,
+    min_visual_actions_before_stop: int = 0,
 ) -> torch.Tensor:
     """Compute current log-prob for a stored action under replay state."""
     type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
+    type_logits = _masked_stop_logits(
+        type_logits,
+        model,
+        step_idx,
+        selected_visual_count,
+        min_controller_actions_before_stop=min_controller_actions_before_stop,
+        min_visual_actions_before_stop=min_visual_actions_before_stop,
+    )
     scaled_type = _scaled_logits(type_logits, temperature)
-    action_id = {name: idx for idx, name in ACTION_NAMES.items()}[str(action["type"]).upper()]
+    action_name_to_id = getattr(model, "action_name_to_id", {name: idx for idx, name in ACTION_NAMES.items()})
+    action_id = action_name_to_id[str(action["type"]).upper()]
     action_tensor = torch.tensor([action_id], device=scaled_type.device, dtype=torch.long)
     log_prob = Categorical(logits=scaled_type).log_prob(action_tensor).squeeze(0)
-    if action_id == ACTION_REGION:
+    action_name = str(action["type"]).upper()
+    if action_name == "REGION":
         scaled_region = _scaled_logits(region_logits, temperature)
         region_tensor = torch.tensor([int(action["region_idx"])], device=scaled_region.device, dtype=torch.long)
         log_prob = log_prob + Categorical(logits=scaled_region).log_prob(region_tensor).squeeze(0)
-    elif action_id == ACTION_PATCH:
+    elif action_name == "PATCH":
         scaled_patch = _scaled_logits(_masked_patch_logits(patch_logits, selected_patches), temperature)
         patch_tensor = torch.tensor([int(action["patch_idx"])], device=scaled_patch.device, dtype=torch.long)
         log_prob = log_prob + Categorical(logits=scaled_patch).log_prob(patch_tensor).squeeze(0)
@@ -274,16 +404,35 @@ def recompute_action_log_probs(
     actions: Sequence[Dict[str, Any]],
     temperature: float,
     image_size: Optional[int] = None,
+    min_controller_actions_before_stop: int = 0,
+    min_visual_actions_before_stop: int = 0,
 ) -> List[torch.Tensor]:
     """Replay stored actions and recompute current-policy log-probs."""
     state, bank = prepare_full_context_state_and_bank(model, image, question, image_size=image_size)
     selected_patches: set[int] = set()
+    selected_visual_count = 0
     log_probs: List[torch.Tensor] = []
     for step_idx, action in enumerate(actions):
-        log_probs.append(action_log_prob_for_replay(model, state, bank, action, step_idx, temperature, selected_patches))
+        log_probs.append(
+            action_log_prob_for_replay(
+                model,
+                state,
+                bank,
+                action,
+                step_idx,
+                temperature,
+                selected_patches,
+                selected_visual_count=selected_visual_count,
+                min_controller_actions_before_stop=min_controller_actions_before_stop,
+                min_visual_actions_before_stop=min_visual_actions_before_stop,
+            )
+        )
         action_type = str(action["type"]).upper()
         if action_type == "PATCH":
             selected_patches.add(int(action["patch_idx"]))
+            selected_visual_count += 1
+        elif action_type in {"REGION", "GLOBAL"}:
+            selected_visual_count += 1
         if action_type == "STOP":
             break
         with torch.no_grad():
@@ -313,6 +462,40 @@ def clipped_grpo_loss(
     if not loss_terms:
         return None
     return torch.stack(loss_terms).mean()
+
+
+def clipped_grpo_diagnostics(
+    advantages: torch.Tensor,
+    rollouts: Sequence[Dict[str, Any]],
+    current_log_probs: Sequence[Sequence[torch.Tensor]],
+    clip_epsilon: float = 0.2,
+) -> Dict[str, float]:
+    """Return ratio/clip diagnostics for PPO-style Phase 5 updates."""
+    ratios: List[torch.Tensor] = []
+    clipped_flags: List[torch.Tensor] = []
+    for rollout, current_steps in zip(rollouts, current_log_probs):
+        old_steps = rollout.get("old_log_probs") or []
+        for current_log_prob, old_log_prob in zip(current_steps, old_steps):
+            ratio = torch.exp(current_log_prob.detach() - old_log_prob.to(current_log_prob.device).detach())
+            ratios.append(ratio.float())
+            clipped_flags.append((torch.abs(ratio - 1.0) > float(clip_epsilon)).float())
+    if not ratios:
+        return {
+            "adv_mean": float(advantages.detach().float().mean().item()) if advantages.numel() else 0.0,
+            "adv_std": float(advantages.detach().float().std(unbiased=False).item()) if advantages.numel() else 0.0,
+            "adv_abs_mean": float(advantages.detach().float().abs().mean().item()) if advantages.numel() else 0.0,
+            "mean_ratio": 0.0,
+            "clip_fraction": 0.0,
+        }
+    ratio_tensor = torch.stack(ratios)
+    clipped_tensor = torch.stack(clipped_flags)
+    return {
+        "adv_mean": float(advantages.detach().float().mean().item()),
+        "adv_std": float(advantages.detach().float().std(unbiased=False).item()),
+        "adv_abs_mean": float(advantages.detach().float().abs().mean().item()),
+        "mean_ratio": float(ratio_tensor.mean().item()),
+        "clip_fraction": float(clipped_tensor.mean().item()),
+    }
 
 
 def target_logprob(model: torch.nn.Module, state: Dict[str, Any], target_text: str) -> torch.Tensor:
@@ -393,6 +576,11 @@ def compute_phase5_reward(
     use_counterfactual_reward: bool = True,
     cf_random_image_probability: float = 0.35,
     no_stop_penalty: float = 0.2,
+    think_once_bonus: float = 0.05,
+    no_visual_penalty: float = 0.3,
+    early_stop_penalty: float = 0.3,
+    min_controller_actions_before_stop: int = 0,
+    min_visual_actions_before_stop: int = 0,
     image_size: Optional[int] = None,
 ) -> Dict[str, float]:
     """Compute Phase 5 compact reward and components."""
@@ -411,14 +599,36 @@ def compute_phase5_reward(
             random_image_probability=cf_random_image_probability,
             image_size=image_size,
         )
+    num_steps = int(rollout.get("num_steps", len(rollout.get("actions", []))))
+    visual_count = len(rollout.get("selected_visual_actions") or [])
     r_stop = 0.0 if rollout.get("stopped") else -float(no_stop_penalty)
-    reward = float(correctness_score) + float(logp_weight) * r_logp + float(counterfactual_weight) * r_cf + r_stop
+    r_visual = -float(no_visual_penalty) if visual_count < int(min_visual_actions_before_stop) else 0.0
+    r_early_stop = 0.0
+    if rollout.get("stopped") and num_steps <= int(min_controller_actions_before_stop):
+        r_early_stop = -float(early_stop_penalty)
+    think_count = sum(1 for action in rollout.get("actions", []) if str(action.get("type", "")).upper() == "THINK")
+    r_think_once = float(think_once_bonus) if think_count == 1 else 0.0
+    reward = (
+        float(correctness_score)
+        + float(logp_weight) * r_logp
+        + float(counterfactual_weight) * r_cf
+        + r_stop
+        + r_visual
+        + r_early_stop
+        + r_think_once
+    )
     return {
         "reward": reward,
         "r_correct": float(correctness_score),
         "r_logp": r_logp,
         "r_cf": r_cf,
         "r_stop": r_stop,
+        "r_visual": r_visual,
+        "r_early_stop": r_early_stop,
+        "r_think_once": r_think_once,
+        "think_count": float(think_count),
+        "visual_count": float(visual_count),
+        "num_steps": float(num_steps),
     }
 
 

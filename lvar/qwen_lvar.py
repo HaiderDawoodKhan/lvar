@@ -3,7 +3,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from lvar.utils import (
@@ -14,6 +13,7 @@ from lvar.utils import (
     ACTION_STOP,
     ACTION_THINK,
     extract_tagged_answer,
+    normalize_action_names,
 )
 
 try:
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - exercised in environments without PEFT
 
 
 class ControllerHead(nn.Module):
-    """Small policy head that scores action type and visual-unit indices."""
+    """Small policy head that scores action type and fixed visual-unit indices."""
 
     def __init__(
         self,
@@ -39,7 +39,8 @@ class ControllerHead(nn.Module):
         num_actions: int,
         use_control_tokens: bool = False,
         controller_num_states: int = 1,
-        index_temperature: float = 0.07,
+        num_regions: int = 25,
+        num_patches: int = 100,
     ) -> None:
         """
         Args:
@@ -48,29 +49,33 @@ class ControllerHead(nn.Module):
             use_control_tokens: Whether latent/act control tokens are enabled.
             controller_num_states: Number of hidden-state positions read by the
                 controller in tokenless mode.
-            index_temperature: Temperature for normalized region/patch similarities.
+            num_regions: Fixed number of region classes.
+            num_patches: Fixed number of patch classes.
 
         Attributes:
             fuse: MLP combining controller state embeddings.
             type_head: Produces logits for THINK/STOP/GLOBAL/REGION/PATCH.
-            region_query: Projects controller state into region-selection query.
-            patch_query: Projects controller state into patch-selection query.
+            region_head: Produces logits over fixed region indices.
+            patch_head: Produces logits over fixed patch indices.
         """
         super().__init__()
         self.use_control_tokens = use_control_tokens
-        self.index_temperature = float(index_temperature)
-        if self.index_temperature <= 0.0:
-            raise ValueError("index_temperature must be greater than 0.")
+        self.num_regions = int(num_regions)
+        self.num_patches = int(num_patches)
+        if self.num_regions <= 0:
+            raise ValueError("num_regions must be greater than 0.")
+        if self.num_patches <= 0:
+            raise ValueError("num_patches must be greater than 0.")
         input_factor = 3 if use_control_tokens else controller_num_states + 1
         self.fuse = nn.Sequential(
             nn.Linear(hidden_size * input_factor, hidden_size),
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
+            nn.GELU(),
         )
         self.type_head = nn.Linear(hidden_size, num_actions)
-        self.region_query = nn.Linear(hidden_size, hidden_size)
-        self.patch_query = nn.Linear(hidden_size, hidden_size)
+        self.region_head = nn.Linear(hidden_size, self.num_regions)
+        self.patch_head = nn.Linear(hidden_size, self.num_patches)
 
     def forward(
         self,
@@ -89,21 +94,7 @@ class ControllerHead(nn.Module):
             controller_inputs = [state_hidden, step_hidden]
         controller_hidden = self.fuse(torch.cat(controller_inputs, dim=-1))
         type_logits = self.type_head(controller_hidden)
-
-        # Broadcast bank vectors so each batch item gets the same visual candidate set.
-        batch_size = controller_hidden.size(0)
-        region_bank = bank["regions"].unsqueeze(0).expand(batch_size, -1, -1)
-        patch_bank = bank["patches"].unsqueeze(0).expand(batch_size, -1, -1)
-
-        # Score visual candidates with normalized similarities so CE scale stays bounded.
-        region_query = F.normalize(self.region_query(controller_hidden), dim=-1).unsqueeze(-1)
-        patch_query = F.normalize(self.patch_query(controller_hidden), dim=-1).unsqueeze(-1)
-        region_bank = F.normalize(region_bank, dim=-1)
-        patch_bank = F.normalize(patch_bank, dim=-1)
-
-        region_logits = torch.bmm(region_bank, region_query).squeeze(-1) / self.index_temperature
-        patch_logits = torch.bmm(patch_bank, patch_query).squeeze(-1) / self.index_temperature
-        return type_logits, region_logits, patch_logits
+        return type_logits, self.region_head(controller_hidden), self.patch_head(controller_hidden)
 
 
 class QwenLVAR(nn.Module):
@@ -145,7 +136,11 @@ class QwenLVAR(nn.Module):
         self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
         self.action_selection = cfg.get("action_selection", "argmax")
         self.controller_temperature = float(cfg.get("controller_temperature", 1.0))
-        self.controller_index_temperature = float(cfg.get("controller_index_temperature", 0.07))
+        self.controller_num_regions = int(cfg.get("controller_num_regions", 25))
+        self.controller_num_patches = int(cfg.get("controller_num_patches", 100))
+        self.action_names = normalize_action_names(cfg.get("controller_action_names"))
+        self.action_name_to_id = {name: idx for idx, name in self.action_names.items()}
+        self.mask_immediate_repeats = bool(cfg.get("mask_immediate_repeats", False))
         self.pooling = self._resolve_pooling(cfg.get("pooling", "mean"))
         self.use_control_tokens = bool(cfg.get("use_control_tokens", False))
         self.think_append_hidden = bool(cfg.get("think_append_hidden", True))
@@ -156,8 +151,10 @@ class QwenLVAR(nn.Module):
 
         if self.controller_temperature <= 0.0:
             raise ValueError("controller_temperature must be greater than 0.")
-        if self.controller_index_temperature <= 0.0:
-            raise ValueError("controller_index_temperature must be greater than 0.")
+        if self.controller_num_regions <= 0:
+            raise ValueError("controller_num_regions must be greater than 0.")
+        if self.controller_num_patches <= 0:
+            raise ValueError("controller_num_patches must be greater than 0.")
         if self.controller_num_states <= 0:
             raise ValueError("controller_context_window must be greater than 0.")
         if self.controller_max_steps <= 0:
@@ -205,10 +202,11 @@ class QwenLVAR(nn.Module):
         self.controller_state_norm = nn.LayerNorm(self.hidden_size)
         self.controller = ControllerHead(
             self.hidden_size,
-            len(ACTION_NAMES),
+            len(self.action_names),
             use_control_tokens=self.use_control_tokens,
             controller_num_states=self.controller_num_states,
-            index_temperature=self.controller_index_temperature,
+            num_regions=self.controller_num_regions,
+            num_patches=self.controller_num_patches,
         )
         self.step_embedding = nn.Embedding(self.controller_max_steps, self.hidden_size)
 
@@ -420,11 +418,11 @@ class QwenLVAR(nn.Module):
         clean_state_dict = self._clean_checkpoint_state_dict(state_dict)
         aligned_state_dict = self._align_checkpoint_state_dict(clean_state_dict, self.backbone.state_dict())
         missing, unexpected = self.backbone.load_state_dict(aligned_state_dict, strict=False)
-        # print(f"Loaded backbone checkpoint: {self.checkpoint_path}")
-        # print("Missing backbone keys:", len(missing))
-        # print("Unexpected backbone keys:", len(unexpected))
-        # print("First missing backbone keys:", missing[:20])
-        # print("First unexpected backbone keys:", unexpected[:20])
+        print(f"Loaded backbone checkpoint: {self.checkpoint_path}")
+        print("Missing backbone keys:", len(missing))
+        print("Unexpected backbone keys:", len(unexpected))
+        print("First missing backbone keys:", missing[:20])
+        print("First unexpected backbone keys:", unexpected[:20])
         if bool(self.cfg.get("merge_lora", False)):
             if not hasattr(self.backbone, "merge_and_unload"):
                 raise ValueError("merge_lora is true, but the backbone is not a mergeable PEFT model.")
@@ -1037,7 +1035,27 @@ class QwenLVAR(nn.Module):
         final_hidden = self._extract_final_hidden(outputs)
         state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         step_hidden = self._controller_step_hidden(step_idx)
-        return self.controller(state_hidden, step_hidden, bank, act_hidden=act_hidden)
+        logits = self.controller(state_hidden, step_hidden, bank, act_hidden=act_hidden)
+        self._validate_fixed_index_logits(logits[1], logits[2], bank)
+        return logits
+
+    def _validate_fixed_index_logits(
+        self,
+        region_logits: torch.Tensor,
+        patch_logits: torch.Tensor,
+        bank: Dict[str, torch.Tensor],
+    ) -> None:
+        """Ensure fixed classifier heads match the current visual bank size."""
+        num_regions = bank["regions"].size(0)
+        num_patches = bank["patches"].size(0)
+        if region_logits.size(-1) != num_regions:
+            raise ValueError(
+                f"Controller region head has {region_logits.size(-1)} classes, but visual bank has {num_regions} regions."
+            )
+        if patch_logits.size(-1) != num_patches:
+            raise ValueError(
+                f"Controller patch head has {patch_logits.size(-1)} classes, but visual bank has {num_patches} patches."
+            )
 
     def apply_mined_actions(
         self,
@@ -1115,6 +1133,7 @@ class QwenLVAR(nn.Module):
             bank,
             act_hidden=act_hidden,
         )
+        self._validate_fixed_index_logits(region_logits, patch_logits, bank)
         scaled_type_logits = self._scale_controller_logits(type_logits)
         scaled_region_logits = self._scale_controller_logits(region_logits)
         scaled_patch_logits = self._scale_controller_logits(patch_logits)
@@ -1126,16 +1145,23 @@ class QwenLVAR(nn.Module):
             state.get("sample_actions", False),
         )
         action_id = int(action_tensor.item())
-        action_name = ACTION_NAMES[action_id]
-        should_stop = action_id == ACTION_STOP
+        action_name = self.action_names[action_id]
+        should_stop = action_name == "STOP"
 
         # Map action to evidence token selection. THINK and STOP add no evidence.
         region_index = None
         patch_index = None
         evidence_token = None
-        if action_id == ACTION_GLOBAL:
+        if action_name == "GLOBAL":
             evidence_token = bank["global"][0].unsqueeze(0)
-        elif action_id == ACTION_REGION:
+        elif action_name == "REGION":
+            if self.mask_immediate_repeats and state.get("last_action") == "REGION":
+                last_region = state.get("last_region_index")
+                if isinstance(last_region, int) and scaled_region_logits.size(-1) > 1:
+                    masked = scaled_region_logits.clone()
+                    if 0 <= last_region < masked.size(-1):
+                        masked[:, last_region] = torch.finfo(masked.dtype).min
+                        scaled_region_logits = masked
             region_tensor, region_log_prob = self._select_index(
                 scaled_region_logits,
                 state.get("sample_actions", False),
@@ -1143,7 +1169,14 @@ class QwenLVAR(nn.Module):
             region_index = int(region_tensor.item())
             action_log_prob = action_log_prob + region_log_prob
             evidence_token = bank["raw_regions"][region_index]
-        elif action_id == ACTION_PATCH:
+        elif action_name == "PATCH":
+            if self.mask_immediate_repeats and state.get("last_action") == "PATCH":
+                last_patch = state.get("last_patch_index")
+                if isinstance(last_patch, int) and scaled_patch_logits.size(-1) > 1:
+                    masked = scaled_patch_logits.clone()
+                    if 0 <= last_patch < masked.size(-1):
+                        masked[:, last_patch] = torch.finfo(masked.dtype).min
+                        scaled_patch_logits = masked
             patch_tensor, patch_log_prob = self._select_index(
                 scaled_patch_logits,
                 state.get("sample_actions", False),
@@ -1154,7 +1187,7 @@ class QwenLVAR(nn.Module):
 
         sequence_length_before = state["inputs_embeds"].size(1)
         # THINK is the only action that performs a pure recurrent hidden-state update.
-        if action_id == ACTION_THINK:
+        if action_name == "THINK":
             if self.think_append_hidden:
                 self._append_hidden_token(state, last_hidden)
             elif self.use_control_tokens:
@@ -1179,6 +1212,7 @@ class QwenLVAR(nn.Module):
             "step_idx": step_idx,
             "action_id": action_id,
             "action": action_name,
+            "action_names": self.action_names,
             "should_stop": should_stop,
             "action_probs": action_probs,
             "region_probs": region_probs,
@@ -1192,6 +1226,9 @@ class QwenLVAR(nn.Module):
         }
         state["trace"].append(step_trace)
         state["action_log_probs"].append(action_log_prob)
+        state["last_action"] = action_name
+        state["last_region_index"] = region_index
+        state["last_patch_index"] = patch_index
         return state, action_id, should_stop, step_trace
 
     def drop_act_token(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1289,12 +1326,18 @@ class QwenLVAR(nn.Module):
         sample_actions: Optional[bool] = None,
         add_answer_instruction: bool = True,
         use_coarse_context: bool = False,
+        image_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Main LVAR path: prepare -> visual bank -> recurrent loop -> act drop -> decode.
         """
         # Build model-ready inputs and visual candidate bank.
-        prepared = self.prepare_inputs(images, questions, add_answer_instruction=add_answer_instruction)
+        prepared = self.prepare_inputs(
+            images,
+            questions,
+            add_answer_instruction=add_answer_instruction,
+            image_size=image_size,
+        )
         image_tokens = self.get_projected_image_tokens(prepared)
         prepared["projected_image_tokens"] = image_tokens
         bank = self.build_visual_bank(image_tokens)
@@ -1424,12 +1467,17 @@ class QwenLVAR(nn.Module):
             "num_region_tokens": region_tokens.size(0),
         }
 
-    def generate_lvar(self, images: Any, questions: Any) -> Dict[str, Any]:
+    def generate_lvar(self, images: Any, questions: Any, image_size: Optional[int] = None) -> Dict[str, Any]:
         """Inference wrapper for LVAR with deterministic (argmax) controller behavior."""
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            output = self.forward(images, questions, sample_actions=self._inference_uses_sampling())
+            output = self.forward(
+                images,
+                questions,
+                sample_actions=self._inference_uses_sampling(),
+                image_size=image_size,
+            )
         self.train(was_training)
         return {
             "prediction": output["answer"],

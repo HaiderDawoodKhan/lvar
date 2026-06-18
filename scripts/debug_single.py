@@ -13,8 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lvar.dataset import build_dataset
+from lvar.grpo_training import load_controller_checkpoint, load_vlm_lora_checkpoint
 from lvar.qwen_lvar import QwenLVAR
-from lvar.utils import add_model_loading_args, apply_model_loading_overrides, format_trace_step
+from lvar.utils import ACTION_NAMES_NO_GLOBAL, add_model_loading_args, apply_model_loading_overrides, format_trace_step
 
 
 def load_config(config_path: str):
@@ -64,12 +65,48 @@ def main() -> None:
         action="store_true",
         help="If set, run 6 stochastic LVAR rollouts for the same question.",
     )
+    parser.add_argument(
+        "--phase4-vlm-checkpoint-path",
+        default=None,
+        help="Override debug/phase5/phase3 Phase 4 VLM LoRA checkpoint path.",
+    )
+    parser.add_argument(
+        "--controller-checkpoint-path",
+        default=None,
+        help="Override debug/phase5/phase3 controller checkpoint path.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
     dataset_cfg = config["dataset"]
+    debug_cfg = config.get("debug", {})
+    phase3_cfg = config.get("phase3", {})
+    phase5_cfg = config.get("phase5", {})
+    inference_cfg = config.get("inference", {})
+
+    use_no_global_controller = bool(phase3_cfg.get("phase3_v2", False)) or bool(phase3_cfg.get("remove_global", False))
+    if use_no_global_controller:
+        config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
+    if "mask_immediate_repeats" in inference_cfg:
+        config["model"]["mask_immediate_repeats"] = bool(inference_cfg["mask_immediate_repeats"])
+    if "action_selection" in inference_cfg:
+        config["model"]["action_selection"] = inference_cfg["action_selection"]
+
+    phase4_vlm_checkpoint_path = (
+        args.phase4_vlm_checkpoint_path
+        or debug_cfg.get("phase4_vlm_checkpoint_path")
+        or phase5_cfg.get("phase4_vlm_checkpoint_path")
+        or phase3_cfg.get("phase4_vlm_checkpoint_path")
+    )
+    controller_checkpoint_path = (
+        args.controller_checkpoint_path
+        or debug_cfg.get("controller_checkpoint_path")
+        or phase5_cfg.get("controller_checkpoint_path")
+        or phase3_cfg.get("controller_checkpoint_path")
+        or inference_cfg.get("controller_checkpoint_path")
+    )
 
     # Build dataset and model exactly like main inference path so debug reflects real behavior.
     dataset = build_dataset(dataset_cfg, limit=dataset_cfg.get("limit"))
@@ -77,7 +114,21 @@ def main() -> None:
     example = dataset[index]
 
     model = QwenLVAR(config["model"])
-    image_size = int(config.get("debug", {}).get("image_size", config.get("phase2", {}).get("image_size", 280)))
+    if phase4_vlm_checkpoint_path:
+        loaded = load_vlm_lora_checkpoint(model, phase4_vlm_checkpoint_path)
+        print(
+            f"Loaded Phase 4 VLM LoRA checkpoint: {phase4_vlm_checkpoint_path}"
+            if loaded
+            else f"Phase 4 VLM LoRA checkpoint not found: {phase4_vlm_checkpoint_path}"
+        )
+    if controller_checkpoint_path:
+        loaded = load_controller_checkpoint(model, controller_checkpoint_path)
+        print(
+            f"Loaded controller checkpoint: {controller_checkpoint_path}"
+            if loaded
+            else f"Controller checkpoint not found: {controller_checkpoint_path}"
+        )
+    image_size = int(debug_cfg.get("image_size", config.get("phase2", {}).get("image_size", 280)))
     image = resize_image(example["image"], image_size)
     print_visual_token_stats(model, image, example["question"], image_size)
 
@@ -94,11 +145,12 @@ def main() -> None:
                         image,
                         example["question"],
                         sample_actions=True,
+                        image_size=image_size,
                     )
                 )
         model.train(was_training)
     else:
-        lvar_output = model.generate_lvar(image, example["question"])
+        lvar_output = model.generate_lvar(image, example["question"], image_size=image_size)
     # baseline_output = model.generate_baseline(example["image"], example["question"])
 
     # Print structured trace for quick inspection of action choices and loop length.

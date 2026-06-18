@@ -15,8 +15,10 @@ from lvar.dataset import build_dataset
 from lvar.grpo_training import (
     Phase5MetricTracker,
     clipped_grpo_loss,
+    clipped_grpo_diagnostics,
     compute_phase5_reward,
-    load_trainable_checkpoint,
+    load_controller_checkpoint,
+    load_vlm_lora_checkpoint,
     normalize_group_rewards as phase5_normalize_group_rewards,
     recompute_action_log_probs,
     rollout_phase5,
@@ -25,7 +27,7 @@ from lvar.grpo_training import (
 )
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import correctness_reward
-from lvar.utils import add_model_loading_args, apply_model_loading_overrides
+from lvar.utils import ACTION_NAMES_NO_GLOBAL, add_model_loading_args, apply_model_loading_overrides
 
 try:
     from accelerate import Accelerator
@@ -140,6 +142,10 @@ def main() -> None:
     if "controller_max_steps" in train_cfg:
         config["model"]["controller_max_steps"] = int(train_cfg["controller_max_steps"])
         config["model"]["max_steps"] = int(train_cfg["controller_max_steps"])
+    if bool(config.get("phase3", {}).get("phase3_v2", False)) or bool(config.get("phase3", {}).get("remove_global", False)):
+        config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
+    if "mask_immediate_repeats" in config.get("inference", {}):
+        config["model"]["mask_immediate_repeats"] = bool(config["inference"]["mask_immediate_repeats"])
     if "rollout_temperature" in train_cfg:
         config["model"]["controller_temperature"] = float(train_cfg["rollout_temperature"])
     dataset_partition = train_cfg.get("dataset_partition", "validation")
@@ -149,12 +155,26 @@ def main() -> None:
     set_seed(int(train_cfg.get("seed", 42)))
     accelerator = Accelerator()
     model = QwenLVAR(config["model"]).to(accelerator.device)
-    phase4_checkpoint_path = train_cfg.get("phase4_checkpoint_path")
-    loaded_phase4 = False
-    if phase4_checkpoint_path:
-        loaded_phase4 = load_trainable_checkpoint(model, phase4_checkpoint_path)
+    phase4_vlm_checkpoint_path = train_cfg.get("phase4_vlm_checkpoint_path", train_cfg.get("phase4_checkpoint_path"))
+    controller_checkpoint_path = train_cfg.get("controller_checkpoint_path")
+    loaded_phase4_vlm = False
+    loaded_controller = False
+    if phase4_vlm_checkpoint_path:
+        loaded_phase4_vlm = load_vlm_lora_checkpoint(model, phase4_vlm_checkpoint_path)
         if accelerator.is_local_main_process:
-            print(f"Loaded Phase 4 checkpoint: {phase4_checkpoint_path}" if loaded_phase4 else f"Phase 4 checkpoint not found: {phase4_checkpoint_path}")
+            print(
+                f"Loaded Phase 4 VLM LoRA checkpoint: {phase4_vlm_checkpoint_path}"
+                if loaded_phase4_vlm
+                else f"Phase 4 VLM LoRA checkpoint not found: {phase4_vlm_checkpoint_path}"
+            )
+    if controller_checkpoint_path:
+        loaded_controller = load_controller_checkpoint(model, controller_checkpoint_path)
+        if accelerator.is_local_main_process:
+            print(
+                f"Loaded controller checkpoint: {controller_checkpoint_path}"
+                if loaded_controller
+                else f"Controller checkpoint not found: {controller_checkpoint_path}"
+            )
     model.train()
     trainable_params = set_phase5_trainable(model)
 
@@ -192,6 +212,11 @@ def main() -> None:
     use_counterfactual_reward = bool(train_cfg.get("use_counterfactual_reward", True))
     cf_random_image_probability = float(train_cfg.get("cf_random_image_probability", 0.35))
     no_stop_penalty = float(train_cfg.get("no_stop_penalty", 0.2))
+    think_once_bonus = float(train_cfg.get("think_once_bonus", 0.05))
+    no_visual_penalty = float(train_cfg.get("no_visual_penalty", 0.3))
+    early_stop_penalty = float(train_cfg.get("early_stop_penalty", 0.3))
+    min_controller_actions_before_stop = int(train_cfg.get("min_controller_actions_before_stop", 2))
+    min_visual_actions_before_stop = int(train_cfg.get("min_visual_actions_before_stop", 1))
     rng = random.Random(int(train_cfg.get("seed", 42)))
     metric_tracker = Phase5MetricTracker()
 
@@ -231,6 +256,8 @@ def main() -> None:
                     max_controller_steps=max_controller_steps,
                     temperature=rollout_temperature,
                     image_size=image_size,
+                    min_controller_actions_before_stop=min_controller_actions_before_stop,
+                    min_visual_actions_before_stop=min_visual_actions_before_stop,
                 )
                 rollout_outputs.append(rollout)
 
@@ -251,6 +278,11 @@ def main() -> None:
                     use_counterfactual_reward=use_counterfactual_reward,
                     cf_random_image_probability=cf_random_image_probability,
                     no_stop_penalty=no_stop_penalty,
+                    think_once_bonus=think_once_bonus,
+                    no_visual_penalty=no_visual_penalty,
+                    early_stop_penalty=early_stop_penalty,
+                    min_controller_actions_before_stop=min_controller_actions_before_stop,
+                    min_visual_actions_before_stop=min_visual_actions_before_stop,
                     image_size=image_size,
                 )
                 reward_components.append(components)
@@ -292,6 +324,14 @@ def main() -> None:
                 continue
 
             loss = None
+            last_diagnostics = {
+                "adv_mean": float(advantages.detach().float().mean().item()),
+                "adv_std": float(advantages.detach().float().std(unbiased=False).item()),
+                "adv_abs_mean": float(advantages.detach().float().abs().mean().item()),
+                "mean_ratio": 0.0,
+                "clip_fraction": 0.0,
+                "grad_norm": 0.0,
+            }
             for _ in range(update_epochs):
                 current_log_probs = [
                     recompute_action_log_probs(
@@ -301,6 +341,8 @@ def main() -> None:
                         rollout["actions"],
                         temperature=rollout_temperature,
                         image_size=image_size,
+                        min_controller_actions_before_stop=min_controller_actions_before_stop,
+                        min_visual_actions_before_stop=min_visual_actions_before_stop,
                     )
                     for rollout in rollout_outputs
                 ]
@@ -314,11 +356,18 @@ def main() -> None:
                     continue
 
                 loss_value = float(loss.detach().item())
+                last_diagnostics = clipped_grpo_diagnostics(
+                    advantages,
+                    rollout_outputs,
+                    current_log_probs,
+                    clip_epsilon=clip_epsilon,
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 accelerator.backward(loss)
 
-                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_norm)
+                last_diagnostics["grad_norm"] = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
 
                 optimizer.step()
 
@@ -338,6 +387,12 @@ def main() -> None:
                     f"reward_mean={float(reward_tensor.mean().item()):.4f} "
                     f"reward_std={float(reward_tensor.std(unbiased=False).item()):.4f} "
                     f"baseline_score={baseline_score_float:.1f} "
+                    f"adv_mean={last_diagnostics['adv_mean']:.4f} "
+                    f"adv_std={last_diagnostics['adv_std']:.4f} "
+                    f"adv_abs_mean={last_diagnostics['adv_abs_mean']:.4f} "
+                    f"mean_ratio={last_diagnostics['mean_ratio']:.4f} "
+                    f"clip_fraction={last_diagnostics['clip_fraction']:.4f} "
+                    f"grad_norm={last_diagnostics['grad_norm']:.4f} "
                     f"metrics={metric_tracker.summary()} "
                 )
         if accelerator.is_local_main_process:
@@ -348,7 +403,10 @@ def main() -> None:
                 metadata={
                     "phase": "phase5_grpo",
                     "epoch": epoch + 1,
-                    "loaded_phase4": loaded_phase4,
+                    "loaded_phase4_vlm": loaded_phase4_vlm,
+                    "loaded_controller": loaded_controller,
+                    "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
+                    "controller_checkpoint_path": controller_checkpoint_path,
                     "dataset_partition": dataset_partition,
                     "metrics": metric_tracker.summary(),
                 },
@@ -362,7 +420,10 @@ def main() -> None:
             checkpoint_path,
             metadata={
                 "phase": "phase5_grpo",
-                "loaded_phase4": loaded_phase4,
+                "loaded_phase4_vlm": loaded_phase4_vlm,
+                "loaded_controller": loaded_controller,
+                "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
+                "controller_checkpoint_path": controller_checkpoint_path,
                 "dataset_partition": dataset_partition,
                 "metrics": metric_tracker.summary(),
             },

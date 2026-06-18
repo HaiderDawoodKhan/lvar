@@ -42,6 +42,52 @@ def load_counterfactual_pairs(path: str | Path, limit: Optional[int] = None) -> 
     return pairs
 
 
+def _flatten_row_actions(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    trace = row.get("trace")
+    if trace:
+        return [copy.deepcopy(action) for action in trace if str(action.get("type", "")).upper() != "STOP"]
+    actions: List[Dict[str, Any]] = []
+    for decision in row.get("decisions") or []:
+        for action in decision.get("actions") or []:
+            if str(action.get("type", "")).upper() != "STOP":
+                actions.append(copy.deepcopy(action))
+    return actions
+
+
+def _row_target_text(row: Dict[str, Any]) -> str:
+    if row.get("target_text"):
+        return str(row["target_text"])
+    for pair in row.get("counterfactual_pairs") or []:
+        if pair.get("target_text"):
+            return str(pair["target_text"])
+    return str(row.get("answer") or row.get("gold_answer") or "")
+
+
+def load_positive_ce_examples(path: str | Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Load one answer-CE training item per mined row."""
+    examples: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            target_text = _row_target_text(row)
+            if not target_text:
+                continue
+            examples.append(
+                {
+                    "example_id": row.get("example_id"),
+                    "question": row.get("question"),
+                    "positive_actions": _flatten_row_actions(row),
+                    "target_text": target_text,
+                }
+            )
+            if limit is not None and len(examples) >= limit:
+                break
+    return examples
+
+
 def validate_negative_type_probs(probs: Dict[str, float]) -> Dict[str, float]:
     """Validate and normalize negative type probabilities."""
     normalized = {name: float(probs.get(name, 0.0)) for name in NEGATIVE_TYPES}
@@ -247,8 +293,9 @@ def _bank_for_example(
         )
         image_tokens = model.get_projected_image_tokens(batch)
         bank = model.build_visual_bank(image_tokens)
-    cache[example_id] = bank
-    return bank
+    cached_bank = {key: value.detach().cpu() for key, value in bank.items()}
+    cache[example_id] = cached_bank
+    return cached_bank
 
 
 def build_negative_actions(
@@ -451,6 +498,7 @@ def replay_counterfactual_pair_loss(
     positive_ce_weight: float = 0.2,
     rank_weight: float = 0.4,
     controller_loss_weight: float = 1.0,
+    rank_target: str = "full",
     noise_scale: float = 0.5,
     negative_bank_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
@@ -483,6 +531,10 @@ def replay_counterfactual_pair_loss(
     positive_actions = pair.get("positive_actions") or []
     target_text = str(pair.get("target_text") or "")
     answer_target_text = extract_answer_target_text(target_text)
+    rank_target_mode = str(rank_target).strip().lower()
+    if rank_target_mode not in {"full", "answer"}:
+        raise ValueError("rank_target must be 'full' or 'answer'.")
+    rank_target_text = answer_target_text if rank_target_mode == "answer" else target_text
 
     pos_state = model.clone_state(base_state)
     neg_state = model.clone_state(base_state)
@@ -499,9 +551,9 @@ def replay_counterfactual_pair_loss(
     apply_counterfactual_actions(model, pos_state, bank, positive_actions)
     apply_counterfactual_actions(model, neg_state, bank, negative_actions)
 
-    ce_pos = differentiable_state_ce(model, pos_state, target_text)
-    ce_neg = differentiable_state_ce(model, neg_state, target_text)
-    ce_pos_answer = differentiable_state_ce(model, pos_state, answer_target_text)
+    ce_pos = differentiable_state_ce(model, pos_state, rank_target_text)
+    ce_neg = differentiable_state_ce(model, neg_state, rank_target_text)
+    ce_pos_answer = ce_pos if rank_target_mode == "answer" else differentiable_state_ce(model, pos_state, answer_target_text)
     rank_loss = torch.relu(torch.tensor(float(rank_margin), device=ce_pos.device, dtype=ce_pos.dtype) + ce_pos - ce_neg)
     total_loss = (
         float(controller_loss_weight) * l_ctrl
@@ -518,6 +570,7 @@ def replay_counterfactual_pair_loss(
         "ce_neg": float(ce_neg.detach().cpu().item()),
         "ce_pos_answer": float(ce_pos_answer.detach().cpu().item()),
         "answer_target_text": answer_target_text,
+        "rank_target": rank_target_mode,
         "margin": float(margin.cpu().item()),
         "rank_loss": float(rank_loss.detach().cpu().item()),
         "satisfied": bool((ce_pos.detach() + float(rank_margin) < ce_neg.detach()).cpu().item()),
@@ -527,6 +580,102 @@ def replay_counterfactual_pair_loss(
         "action_counts": dict(action_counts),
     }
     return total_loss, metrics
+
+
+def rollout_controller_actions_for_ce(
+    model: torch.nn.Module,
+    state: Dict[str, Any],
+    bank: Dict[str, torch.Tensor],
+    max_controller_steps: int,
+    sample_actions: bool = False,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Roll out the loaded controller and mutate state with its selected actions."""
+    actions: List[Dict[str, Any]] = []
+    stopped = False
+    state["sample_actions"] = bool(sample_actions)
+    for step_idx in range(int(max_controller_steps)):
+        with torch.no_grad():
+            state, _, stopped, step_trace = model.forward_reasoning_step(state, bank, step_idx)
+        action: Dict[str, Any] = {"type": step_trace["action"]}
+        if step_trace.get("region_index") is not None:
+            action["region_idx"] = int(step_trace["region_index"])
+        if step_trace.get("patch_index") is not None:
+            action["patch_idx"] = int(step_trace["patch_index"])
+        actions.append(action)
+        if stopped:
+            break
+    return actions, stopped
+
+
+def replay_positive_answer_ce_loss(
+    model: torch.nn.Module,
+    example: Dict[str, Any],
+    source_example: Dict[str, Any],
+    rng: random.Random,
+    context_full_probability: float = 0.2,
+    image_size: Optional[int] = 280,
+    trace_source: str = "gold",
+    max_controller_steps: int = 32,
+    sample_controller_actions: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Train answer-only CE after either gold actions or controller rollout actions."""
+    question = str(example.get("question") or source_example.get("question") or "")
+    trace_source = str(trace_source).strip().lower()
+    actions = []
+    if trace_source == "gold":
+        actions = example.get("positive_actions") or []
+        if not actions:
+            trace_source = "controller"
+    elif trace_source != "controller":
+        raise ValueError("trace_source must be 'gold' or 'controller'.")
+
+    # Gold traces were mined under a mostly coarse/global context, so the
+    # configured probability only applies to gold replay. Controller-generated
+    # traces should reflect inference-time behavior and always start from the
+    # full image-token context.
+    if trace_source == "controller":
+        context_mode = CONTEXT_FULL
+    else:
+        context_mode = sample_context_mode(context_full_probability, rng)
+    state, bank = prepare_phase4_state_and_bank(model, source_example, question, image_size, context_mode)
+
+    if trace_source == "gold":
+        with torch.no_grad():
+            apply_counterfactual_actions(model, state, bank, actions)
+        stopped = any(str(action.get("type", "")).upper() == "STOP" for action in actions)
+    else:
+        actions, stopped = rollout_controller_actions_for_ce(
+            model,
+            state,
+            bank,
+            max_controller_steps=max_controller_steps,
+            sample_actions=sample_controller_actions,
+        )
+
+    target_text = extract_answer_target_text(str(example.get("target_text") or ""))
+    loss = differentiable_state_ce(model, state, target_text)
+    action_counts = Counter(str(action.get("type", "")).upper() for action in actions)
+    metrics = {
+        "example_id": example.get("example_id"),
+        "negative_type": "none",
+        "context_mode": context_mode,
+        "ce_pos": float(loss.detach().cpu().item()),
+        "ce_neg": 0.0,
+        "ce_pos_answer": float(loss.detach().cpu().item()),
+        "answer_target_text": target_text,
+        "rank_target": "answer_only",
+        "margin": 0.0,
+        "rank_loss": 0.0,
+        "satisfied": True,
+        "l_ctrl": 0.0,
+        "controller_loss_weight": 0.0,
+        "loss": float(loss.detach().cpu().item()),
+        "action_counts": dict(action_counts),
+        "trace_source": trace_source,
+        "stopped": bool(stopped),
+        "num_actions": len(actions),
+    }
+    return loss, metrics
 
 
 def phase4_parameter_groups(model: torch.nn.Module) -> Dict[str, List[torch.nn.Parameter]]:

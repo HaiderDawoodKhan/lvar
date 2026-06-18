@@ -82,6 +82,13 @@ def main() -> None:
     parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--dataset-partition", default=None, help="Dataset partition/split to mine, e.g. train or test.")
+    parser.add_argument(
+        "--initial-visual-mode",
+        default=None,
+        choices=["global_mean", "full_context", "global", "coarse"],
+        help="Initial image context used during mining. 'global_mean'/'coarse' uses one pooled visual token; 'full_context'/'global' uses full image tokens.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--start-from-end",
@@ -109,7 +116,8 @@ def main() -> None:
     set_seed(seed)
 
     limit = args.limit if args.limit is not None else phase2_cfg.get("limit", dataset_cfg.get("limit"))
-    dataset = build_dataset(dataset_cfg, limit=limit, partition=phase2_cfg.get("dataset_partition"))
+    dataset_partition = args.dataset_partition or phase2_cfg.get("dataset_partition")
+    dataset = build_dataset(dataset_cfg, limit=limit, partition=dataset_partition)
     output_path = Path(args.output or phase2_cfg.get("output_path", "outputs/phase2_m3cot_traces.jsonl"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     resume = bool(phase2_cfg.get("resume", True)) if args.resume is None else bool(args.resume)
@@ -124,7 +132,7 @@ def main() -> None:
         patch_k_choices=phase2_cfg.get("patch_k_choices", [1, 2, 3, 4]),
         max_steps=int(phase2_cfg.get("max_steps", config["model"].get("max_steps", 8))),
         rng=random.Random(seed),
-        initial_visual_mode=str(phase2_cfg.get("initial_visual_mode", "global_mean")),
+        initial_visual_mode=str(args.initial_visual_mode or phase2_cfg.get("initial_visual_mode", "global_mean")),
         image_size=phase2_cfg.get("image_size", 280),
         counterfactual_negative_source=str(phase2_cfg.get("counterfactual_negative_source", "same_image")),
     )
@@ -153,6 +161,7 @@ def main() -> None:
             "output_path": str(output_path),
             "dataset_type": dataset_cfg.get("type"),
             "dataset_name": dataset_cfg.get("name"),
+            "dataset_partition": dataset_partition or dataset_cfg.get("split"),
             "num_examples": len(dataset),
             "num_mined_this_run": len(pending_indices),
             "num_skipped_existing": skipped_existing,

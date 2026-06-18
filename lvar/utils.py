@@ -19,6 +19,25 @@ ACTION_NAMES: Dict[int, str] = {
 }
 ACTION_NAME_TO_ID: Dict[str, int] = {name: idx for idx, name in ACTION_NAMES.items()}
 
+ACTION_NAMES_NO_GLOBAL: Dict[int, str] = {
+    0: "THINK",
+    1: "STOP",
+    2: "REGION",
+    3: "PATCH",
+}
+ACTION_NAME_TO_ID_NO_GLOBAL: Dict[str, int] = {name: idx for idx, name in ACTION_NAMES_NO_GLOBAL.items()}
+
+
+def normalize_action_names(action_names: Optional[object] = None) -> Dict[int, str]:
+    """Return a stable id->name action map from config metadata."""
+    if action_names is None:
+        return dict(ACTION_NAMES)
+    if isinstance(action_names, dict):
+        return {int(idx): str(name).upper() for idx, name in action_names.items()}
+    if isinstance(action_names, (list, tuple)):
+        return {idx: str(name).upper() for idx, name in enumerate(action_names)}
+    raise TypeError("controller action_names must be a dict, list, tuple, or None.")
+
 # Regex used everywhere to extract the final tagged answer from model text.
 ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
 
@@ -63,7 +82,18 @@ def _format_probability_distribution(
 def format_trace_step(step_trace: Dict[str, object]) -> str:
     """Render one reasoning step dict into a compact human-readable debug line."""
     action = step_trace.get("action", "UNKNOWN")
-    action_labels = [ACTION_NAMES[idx] for idx in sorted(ACTION_NAMES)]
+    trace_action_names = step_trace.get("action_names")
+    if isinstance(trace_action_names, dict):
+        action_name_map = {int(idx): str(name) for idx, name in trace_action_names.items()}
+        action_labels = [action_name_map[idx] for idx in sorted(action_name_map)]
+    elif isinstance(trace_action_names, (list, tuple)):
+        action_labels = [str(name) for name in trace_action_names]
+    else:
+        action_probs = step_trace.get("action_probs")
+        if isinstance(action_probs, list) and len(action_probs) == len(ACTION_NAMES_NO_GLOBAL):
+            action_labels = [ACTION_NAMES_NO_GLOBAL[idx] for idx in sorted(ACTION_NAMES_NO_GLOBAL)]
+        else:
+            action_labels = [ACTION_NAMES[idx] for idx in sorted(ACTION_NAMES)]
     action_probs = _format_probability_distribution(step_trace.get("action_probs"), action_labels)
     region_probs = _format_probability_distribution(step_trace.get("region_probs"), top_k=2)
     patch_probs = _format_probability_distribution(step_trace.get("patch_probs"), top_k=2)

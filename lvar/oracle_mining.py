@@ -98,7 +98,14 @@ class OracleTraceMiner:
         self.patch_k_choices = list(patch_k_choices or [1, 2, 3, 4])
         self.max_steps = int(max_steps)
         self.rng = rng or random.Random()
-        self.initial_visual_mode = initial_visual_mode
+        visual_mode = str(initial_visual_mode).strip().lower()
+        if visual_mode in {"global", "full", "full_image"}:
+            visual_mode = "full_context"
+        if visual_mode in {"coarse", "coarse_context", "global_token"}:
+            visual_mode = "global_mean"
+        if visual_mode not in {"global_mean", "full_context"}:
+            raise ValueError("initial_visual_mode must be one of: global_mean, full_context.")
+        self.initial_visual_mode = visual_mode
         self.image_size = image_size
         negative_source = str(counterfactual_negative_source).strip().lower()
         if negative_source not in {"same_image", "different_image"}:
@@ -385,7 +392,10 @@ class OracleTraceMiner:
         image_tokens = self.model.get_projected_image_tokens(prepared)
         prepared["projected_image_tokens"] = image_tokens
         bank = self.model.build_visual_bank(image_tokens)
-        state = self.model.build_coarse_initial_state(prepared, bank)
+        if self.initial_visual_mode == "full_context":
+            state = self.model.build_initial_state(prepared)
+        else:
+            state = self.model.build_coarse_initial_state(prepared, bank)
 
         steps = preprocess_reasoning_steps(example, max_steps=self.max_steps)
         answer = extract_tagged_answer(str(example.get("solution") or ""))
@@ -447,6 +457,7 @@ class OracleTraceMiner:
 
     def get_summary(self) -> Dict[str, Any]:
         summary = copy.deepcopy(self.summary)
+        summary["initial_visual_mode"] = self.initial_visual_mode
         summary["counterfactual_negative_source"] = self.counterfactual_negative_source
         return summary
 
