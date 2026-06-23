@@ -1,5 +1,6 @@
 import re
 import argparse
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 # Discrete action ids used by the controller and trace utilities.
@@ -140,6 +141,28 @@ def add_model_loading_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_trace_boost_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared inference-time trace attention boost overrides."""
+    parser.add_argument(
+        "--trace-boost",
+        dest="trace_boost",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable answer-only pre-softmax attention boosting toward LVAR trace tokens.",
+    )
+    parser.add_argument(
+        "--trace-boost-target",
+        choices=["trace_all", "trace_visual"],
+        default=None,
+    )
+    parser.add_argument(
+        "--trace-boost-layer-mode",
+        choices=["all", "latter_half"],
+        default=None,
+    )
+    parser.add_argument("--trace-boost-alpha", type=float, default=None)
+
+
 def apply_model_loading_overrides(model_cfg: Dict[str, object], args: argparse.Namespace) -> Dict[str, object]:
     """Apply optional CLI model-loading overrides to a model config copy."""
     updated_cfg = dict(model_cfg)
@@ -150,3 +173,38 @@ def apply_model_loading_overrides(model_cfg: Dict[str, object], args: argparse.N
     if args.merge_lora is not None:
         updated_cfg["merge_lora"] = args.merge_lora
     return updated_cfg
+
+
+def apply_trace_boost_overrides(model_cfg: Dict[str, object], args: argparse.Namespace) -> Dict[str, object]:
+    """Apply optional CLI trace-boost values over nested model configuration."""
+    updated_cfg = dict(model_cfg)
+    boost_cfg = dict(updated_cfg.get("trace_boost", {}) or {})
+    if getattr(args, "trace_boost", None) is not None:
+        boost_cfg["enabled"] = bool(args.trace_boost)
+    if getattr(args, "trace_boost_target", None) is not None:
+        boost_cfg["target"] = args.trace_boost_target
+    if getattr(args, "trace_boost_layer_mode", None) is not None:
+        boost_cfg["layer_mode"] = args.trace_boost_layer_mode
+    if getattr(args, "trace_boost_alpha", None) is not None:
+        boost_cfg["alpha"] = float(args.trace_boost_alpha)
+    if boost_cfg:
+        updated_cfg["trace_boost"] = boost_cfg
+    return updated_cfg
+
+
+def trace_boost_is_enabled(model_cfg: Dict[str, object]) -> bool:
+    boost_cfg = model_cfg.get("trace_boost", {}) or {}
+    return isinstance(boost_cfg, dict) and bool(boost_cfg.get("enabled", False))
+
+
+def boosted_output_path(path: str, enabled: bool) -> str:
+    """Rewrite known inference directory names when trace boosting is enabled."""
+    if not enabled:
+        return path
+    parts = list(Path(path).parts)
+    replacements = {
+        "current_lvar_model": "current_lvar_model_boosted",
+        "test_oracle": "test_oracle_boosted",
+    }
+    rewritten = [replacements.get(part, part) for part in parts]
+    return str(Path(*rewritten))

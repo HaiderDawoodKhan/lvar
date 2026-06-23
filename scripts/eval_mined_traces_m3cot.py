@@ -17,7 +17,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import verify_choice_output
-from lvar.utils import add_model_loading_args, apply_model_loading_overrides
+from lvar.utils import (
+    add_model_loading_args,
+    add_trace_boost_args,
+    apply_model_loading_overrides,
+    apply_trace_boost_overrides,
+    boosted_output_path,
+    trace_boost_is_enabled,
+)
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -51,6 +58,50 @@ def write_jsonl_row(handle, row: Dict[str, Any]) -> None:
     handle.flush()
 
 
+def entropy_tracking_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_entropy_tracking.json")
+
+
+def build_entropy_tracking_row(
+    example_id: Any,
+    example: Dict[str, Any],
+    decoded: Dict[str, Any],
+    is_correct: bool,
+    context: str,
+    context_mode: str,
+    trace_variant: str,
+    visual_index_mode: str,
+) -> Dict[str, Any]:
+    option_entropy = decoded.get("answer_option_entropy") or {}
+    return {
+        "example_id": example_id,
+        "correct": is_correct,
+        "gold_answer": example["gold_answer"],
+        "raw_answer": example.get("answer", ""),
+        "decoded_answer": decoded.get("answer"),
+        "context": context,
+        "context_mode": context_mode,
+        "trace_variant": trace_variant,
+        "visual_index_mode": visual_index_mode,
+        "num_trace_actions": len(decoded["trace"]),
+        "num_output_tokens": len(decoded["generated_ids"]),
+        "answer_option_entropy": option_entropy.get("entropy"),
+        "answer_option_probabilities": option_entropy.get("softmax_option_probabilities"),
+        "answer_option_raw_probabilities": option_entropy.get("raw_option_probabilities"),
+        "answer_option_token_ids": option_entropy.get("option_token_ids"),
+        "answer_option_selected_option": option_entropy.get("selected_option"),
+        "answer_option_selected_token_id": option_entropy.get("selected_token_id"),
+        "answer_option_decoded_token_index": option_entropy.get("decoded_token_index"),
+        "decoded_token_entropies": decoded["token_entropies"],
+        "decoded_token_entropy_mean": decoded["token_entropy_mean"],
+        "decoded_token_entropy_median": decoded["token_entropy_median"],
+        "decoded_token_entropy_max": decoded["token_entropy_max"],
+        "trace_attention_mass": decoded.get("trace_attention_mass"),
+        "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
+        "think_attention_mass": decoded.get("think_attention_mass"),
+    }
+
+
 def normalize_context_mode(context: str) -> str:
     mode = str(context).strip().lower()
     if mode in {"global", "full", "full_image", "full_context"}:
@@ -58,6 +109,37 @@ def normalize_context_mode(context: str) -> str:
     if mode in {"coarse", "coarse_context", "global_mean", "global_token"}:
         return "global_mean"
     raise ValueError("context must be one of: global, coarse, full_context, global_mean.")
+
+
+def rewrite_visual_action_index(
+    action: Dict[str, Any],
+    index_mode: str,
+    num_regions: int,
+    num_patches: int,
+    rng: Any = random,
+) -> Dict[str, Any]:
+    """Copy one replay action, changing only its visual-bank index when requested."""
+    rewritten = dict(action)
+    action_type = str(rewritten.get("type", "")).upper()
+    mode = str(index_mode).strip().lower()
+    if mode not in {"original", "random", "last"}:
+        raise ValueError("index_mode must be one of: original, random, last.")
+
+    if action_type == "REGION":
+        if num_regions <= 0:
+            raise ValueError("Cannot replay a REGION action with an empty region bank.")
+        if mode == "random":
+            rewritten["region_idx"] = rng.randrange(num_regions)
+        elif mode == "last":
+            rewritten["region_idx"] = num_regions - 1
+    elif action_type == "PATCH":
+        if num_patches <= 0:
+            raise ValueError("Cannot replay a PATCH action with an empty patch bank.")
+        if mode == "random":
+            rewritten["patch_idx"] = rng.randrange(num_patches)
+        elif mode == "last":
+            rewritten["patch_idx"] = num_patches - 1
+    return rewritten
 
 
 def collect_dataset_by_id(dataset: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -201,6 +283,8 @@ def replay_trace_and_decode(
     context_mode: str,
     image_size: Optional[int],
     add_answer_instruction: bool,
+    visual_index_mode: str = "original",
+    rng: Any = random,
 ) -> Dict[str, Any]:
     prepared = model.prepare_inputs(
         example["image"],
@@ -219,8 +303,15 @@ def replay_trace_and_decode(
     replayed_trace = []
     for step_idx, action in enumerate(trace):
         action_type = str(action.get("type", "")).upper()
+        replay_action = rewrite_visual_action_index(
+            action,
+            index_mode=visual_index_mode,
+            num_regions=int(bank["raw_regions"].size(0)),
+            num_patches=int(bank["patches"].size(0)),
+            rng=rng,
+        )
         before = int(state["inputs_embeds"].size(1))
-        model.apply_mined_actions(state, bank, [action])
+        model.apply_mined_actions(state, bank, [replay_action])
         after = int(state["inputs_embeds"].size(1))
         step_info = {
             "step_idx": step_idx,
@@ -228,10 +319,14 @@ def replay_trace_and_decode(
             "sequence_length_before": before,
             "sequence_length_after": after,
         }
-        if action.get("region_idx") is not None:
-            step_info["region_index"] = int(action["region_idx"])
-        if action.get("patch_idx") is not None:
-            step_info["patch_index"] = int(action["patch_idx"])
+        if replay_action.get("region_idx") is not None:
+            step_info["region_index"] = int(replay_action["region_idx"])
+            if visual_index_mode != "original" and action.get("region_idx") is not None:
+                step_info["source_region_index"] = int(action["region_idx"])
+        if replay_action.get("patch_idx") is not None:
+            step_info["patch_index"] = int(replay_action["patch_idx"])
+            if visual_index_mode != "original" and action.get("patch_idx") is not None:
+                step_info["source_patch_index"] = int(action["patch_idx"])
         replayed_trace.append(step_info)
         if action_type == "STOP":
             break
@@ -244,6 +339,16 @@ def replay_trace_and_decode(
         "generated_text": decoded["generated_text"],
         "answer": decoded["answer"],
         "generated_ids": decoded["generated_ids"],
+        "token_entropies": decoded["token_entropies"],
+        "token_entropy_mean": decoded["token_entropy_mean"],
+        "token_entropy_median": decoded["token_entropy_median"],
+        "token_entropy_max": decoded["token_entropy_max"],
+        "answer_option_entropy": decoded["answer_option_entropy"],
+        "trace_attention_mass": decoded.get("trace_attention_mass"),
+        "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
+        "think_attention_mass": decoded.get("think_attention_mass"),
+        "trace_boost_attention_observations": decoded.get("trace_boost_attention_observations", 0),
+        "trace_boost_softmax_hits": decoded.get("trace_boost_softmax_hits", 0),
         "trace": replayed_trace,
         "decode_prefix_length": decoded["decode_prefix_length"],
         "final_sequence_length": decoded["final_sequence_length"],
@@ -272,12 +377,24 @@ def main() -> None:
         help="'global'/'full_context' replays on the full image-token prompt; 'coarse'/'global_mean' replays on one pooled visual token.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--visual-index-mode",
+        default="original",
+        choices=["original", "random", "last"],
+        help=(
+            "Choose visual indices while preserving the mined trace order: "
+            "'original' uses mined indices, 'random' samples each PATCH/REGION index, "
+            "and 'last' always uses the final patch or region."
+        ),
+    )
     parser.add_argument("--add-answer-instruction", action="store_true", default=False)
     add_model_loading_args(parser)
+    add_trace_boost_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
+    config["model"] = apply_trace_boost_overrides(config["model"], args)
     dataset_cfg = config["dataset"]
     phase2_cfg = config.get("phase2", {})
     phase3_cfg = config.get("phase3", {})
@@ -303,8 +420,15 @@ def main() -> None:
     model = QwenLVAR(config["model"])
     model.eval()
 
-    output_path = Path(args.output)
+    output_path = Path(
+        boosted_output_path(
+            args.output,
+            enabled=trace_boost_is_enabled(config["model"]),
+        )
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    entropy_path = entropy_tracking_path(output_path)
+    entropy_rows = []
 
     total = 0
     correct = 0
@@ -313,6 +437,11 @@ def main() -> None:
     total_output_tokens = 0
     transform_totals: Counter[str] = Counter()
     skipped_block_totals: Counter[str] = Counter()
+    attention_mass_values = {
+        "trace_attention_mass": [],
+        "visual_trace_attention_mass": [],
+        "think_attention_mass": [],
+    }
 
     with open(output_path, "w", encoding="utf-8") as handle:
         for trace_row in tqdm(trace_rows, total=len(trace_rows), desc="Replaying traces"):
@@ -339,6 +468,7 @@ def main() -> None:
                     context_mode=context_mode,
                     image_size=image_size,
                     add_answer_instruction=bool(args.add_answer_instruction),
+                    visual_index_mode=args.visual_index_mode,
                 )
 
             generated_text = decoded["generated_text"]
@@ -363,6 +493,7 @@ def main() -> None:
                 "context": args.context,
                 "context_mode": context_mode,
                 "trace_variant": args.trace_variant,
+                "visual_index_mode": args.visual_index_mode,
                 "correct": is_correct,
                 "num_trace_actions": len(decoded["trace"]),
                 "num_output_tokens": len(decoded["generated_ids"]),
@@ -370,19 +501,41 @@ def main() -> None:
                 "decoded_answer": decoded["answer"],
                 "transform": transform_metrics,
                 "trace": decoded["trace"],
+                "trace_attention_mass": decoded.get("trace_attention_mass"),
+                "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
+                "think_attention_mass": decoded.get("think_attention_mass"),
             }
             write_jsonl_row(handle, row)
+            for key in attention_mass_values:
+                value = decoded.get(key)
+                if value is not None:
+                    attention_mass_values[key].append(float(value))
+            entropy_rows.append(
+                build_entropy_tracking_row(
+                    example_id=example_id,
+                    example=example,
+                    decoded=decoded,
+                    is_correct=is_correct,
+                    context=args.context,
+                    context_mode=context_mode,
+                    trace_variant=args.trace_variant,
+                    visual_index_mode=args.visual_index_mode,
+                )
+            )
 
     accuracy = correct / total if total else 0.0
+    write_json(entropy_path, entropy_rows)
     summary = {
         "dataset_type": dataset_cfg.get("type"),
         "dataset_name": dataset_cfg.get("name"),
         "dataset_partition": args.dataset_partition,
         "trace_path": str(trace_path),
         "output_path": str(output_path),
+        "entropy_tracking_path": str(entropy_path),
         "context": args.context,
         "context_mode": context_mode,
         "trace_variant": args.trace_variant,
+        "visual_index_mode": args.visual_index_mode,
         "filtering": {
             "visual_or_region_min_improvement": visual_or_region_min_improvement,
             "think_min_improvement": think_min_improvement,
@@ -394,6 +547,7 @@ def main() -> None:
         },
         "checkpoint_path": config["model"].get("checkpoint_path"),
         "use_checkpoint": config["model"].get("use_checkpoint"),
+        "trace_boost": model.trace_boost_config.to_dict(),
         "add_answer_instruction": bool(args.add_answer_instruction),
         "num_trace_rows": len(trace_rows),
         "num_missing_examples": len(missing),
@@ -406,12 +560,28 @@ def main() -> None:
             "accuracy": round(accuracy, 4),
             "avg_trace_actions": round(total_trace_actions / total, 2) if total else 0.0,
             "avg_output_tokens": round(total_output_tokens / total, 2) if total else 0.0,
+            "trace_attention_mass": (
+                sum(attention_mass_values["trace_attention_mass"])
+                / len(attention_mass_values["trace_attention_mass"])
+                if attention_mass_values["trace_attention_mass"] else None
+            ),
+            "visual_trace_attention_mass": (
+                sum(attention_mass_values["visual_trace_attention_mass"])
+                / len(attention_mass_values["visual_trace_attention_mass"])
+                if attention_mass_values["visual_trace_attention_mass"] else None
+            ),
+            "think_attention_mass": (
+                sum(attention_mass_values["think_attention_mass"])
+                / len(attention_mass_values["think_attention_mass"])
+                if attention_mass_values["think_attention_mass"] else None
+            ),
         },
     }
     summary_path = output_path.with_name(f"{output_path.stem}_summary.json")
     write_json(summary_path, summary)
 
     print(f"Wrote {total} oracle-forced predictions to {output_path}")
+    print(f"Wrote entropy tracking to {entropy_path}")
     print(f"Wrote summary to {summary_path}")
     print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
     if missing:

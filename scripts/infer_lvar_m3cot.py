@@ -16,7 +16,15 @@ from lvar.dataset import build_dataset
 from lvar.grpo_training import load_controller_checkpoint, load_vlm_lora_checkpoint
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import verify_choice_output
-from lvar.utils import ACTION_NAMES_NO_GLOBAL, add_model_loading_args, apply_model_loading_overrides
+from lvar.utils import (
+    ACTION_NAMES_NO_GLOBAL,
+    add_model_loading_args,
+    add_trace_boost_args,
+    apply_model_loading_overrides,
+    apply_trace_boost_overrides,
+    boosted_output_path,
+    trace_boost_is_enabled,
+)
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -51,6 +59,52 @@ def compute_controller_tokens(trace: list) -> int:
     )
 
 
+def entropy_tracking_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_entropy_tracking.json")
+
+
+def build_entropy_tracking_row(example, output, is_correct: bool):
+    option_entropy = output.get("answer_option_entropy") or {}
+    return {
+        "example_id": example["id"],
+        "correct": is_correct,
+        "gold_answer": example["gold_answer"],
+        "raw_answer": example.get("answer", ""),
+        "decoded_answer": output.get("answer"),
+        "num_output_tokens": len(output["generated_ids"]),
+        "answer_option_entropy": option_entropy.get("entropy"),
+        "answer_option_probabilities": option_entropy.get("softmax_option_probabilities"),
+        "answer_option_raw_probabilities": option_entropy.get("raw_option_probabilities"),
+        "answer_option_token_ids": option_entropy.get("option_token_ids"),
+        "answer_option_selected_option": option_entropy.get("selected_option"),
+        "answer_option_selected_token_id": option_entropy.get("selected_token_id"),
+        "answer_option_decoded_token_index": option_entropy.get("decoded_token_index"),
+        "decoded_token_entropies": output["token_entropies"],
+        "decoded_token_entropy_mean": output["token_entropy_mean"],
+        "decoded_token_entropy_median": output["token_entropy_median"],
+        "decoded_token_entropy_max": output["token_entropy_max"],
+        "controller_action_entropies": output["controller_action_entropy_values"],
+        "controller_action_entropy_mean": output["controller_action_entropy_mean"],
+        "controller_action_entropy_median": output["controller_action_entropy_median"],
+        "controller_action_entropy_max": output["controller_action_entropy_max"],
+        "controller_region_entropies": output["controller_region_entropy_values"],
+        "controller_region_entropy_mean": output["controller_region_entropy_mean"],
+        "controller_region_entropy_median": output["controller_region_entropy_median"],
+        "controller_region_entropy_max": output["controller_region_entropy_max"],
+        "controller_patch_entropies": output["controller_patch_entropy_values"],
+        "controller_patch_entropy_mean": output["controller_patch_entropy_mean"],
+        "controller_patch_entropy_median": output["controller_patch_entropy_median"],
+        "controller_patch_entropy_max": output["controller_patch_entropy_max"],
+        "controller_entropies": output["controller_entropy_values"],
+        "controller_entropy_mean": output["controller_entropy_mean"],
+        "controller_entropy_median": output["controller_entropy_median"],
+        "controller_entropy_max": output["controller_entropy_max"],
+        "trace_attention_mass": output.get("trace_attention_mass"),
+        "visual_trace_attention_mass": output.get("visual_trace_attention_mass"),
+        "think_attention_mass": output.get("think_attention_mass"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run LVAR inference on the M3CoT test split with controller traces."
@@ -62,10 +116,12 @@ def main() -> None:
     parser.add_argument("--controller-checkpoint-path", default=None)
     parser.add_argument("--use-coarse-context", action="store_true", default=False)
     add_model_loading_args(parser)
+    add_trace_boost_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
+    config["model"] = apply_trace_boost_overrides(config["model"], args)
     dataset_cfg = config["dataset"]
     inference_cfg = config.get("inference", {})
     train_cfg = config.get("train", {})
@@ -116,11 +172,17 @@ def main() -> None:
     image_size = inference_cfg.get("image_size", config.get("phase2", {}).get("image_size", 280))
     print(f"Using inference image size: {image_size}x{image_size}")
     rows = []
+    entropy_rows = []
     total = 0
     correct = 0
     total_controller_tokens = 0
     total_output_tokens = 0
     total_steps = 0
+    attention_mass_values = {
+        "trace_attention_mass": [],
+        "visual_trace_attention_mass": [],
+        "think_attention_mass": [],
+    }
 
     for example in tqdm(dataset, total=len(dataset), desc="Inferring"):
         total += 1
@@ -176,12 +238,29 @@ def main() -> None:
             "num_total_tokens": num_controller_tokens + num_output_tokens,
             "generated_text": generated_text,
             "trace": tracing,
+            "trace_attention_mass": output.get("trace_attention_mass"),
+            "visual_trace_attention_mass": output.get("visual_trace_attention_mass"),
+            "think_attention_mass": output.get("think_attention_mass"),
         }
         rows.append(row)
+        entropy_rows.append(build_entropy_tracking_row(example, output, is_correct))
+        for key in attention_mass_values:
+            value = output.get(key)
+            if value is not None:
+                attention_mass_values[key].append(float(value))
 
-    output_path = Path(args.output) if args.output else Path(inference_cfg.get("output_path", "outputs/m3cot_lvar_predictions.jsonl"))
+    requested_output = args.output or inference_cfg.get("output_path", "outputs/m3cot_lvar_predictions.jsonl")
+    output_path = Path(
+        boosted_output_path(
+            str(requested_output),
+            enabled=trace_boost_is_enabled(config["model"]),
+        )
+    )
     write_jsonl(output_path, rows)
     print(f"Wrote {len(rows)} predictions to {output_path}")
+    entropy_path = entropy_tracking_path(output_path)
+    write_json(entropy_path, entropy_rows)
+    print(f"Wrote entropy tracking to {entropy_path}")
 
     accuracy = correct / total if total > 0 else 0.0
     avg_steps = total_steps / total if total > 0 else 0.0
@@ -197,6 +276,8 @@ def main() -> None:
         "coarse_context": args.use_coarse_context,
         "phase4_vlm_checkpoint": phase4_vlm_checkpoint_path,
         "controller_checkpoint": controller_checkpoint_path,
+        "trace_boost": model.trace_boost_config.to_dict(),
+        "entropy_tracking_path": str(entropy_path),
         "metrics": {
             "total": total,
             "correct": correct,
@@ -205,6 +286,21 @@ def main() -> None:
             "avg_controller_tokens": round(avg_controller_tokens, 2),
             "avg_output_tokens": round(avg_output_tokens, 2),
             "avg_total_tokens": round(avg_total_tokens, 2),
+            "trace_attention_mass": (
+                sum(attention_mass_values["trace_attention_mass"])
+                / len(attention_mass_values["trace_attention_mass"])
+                if attention_mass_values["trace_attention_mass"] else None
+            ),
+            "visual_trace_attention_mass": (
+                sum(attention_mass_values["visual_trace_attention_mass"])
+                / len(attention_mass_values["visual_trace_attention_mass"])
+                if attention_mass_values["visual_trace_attention_mass"] else None
+            ),
+            "think_attention_mass": (
+                sum(attention_mass_values["think_attention_mass"])
+                / len(attention_mass_values["think_attention_mass"])
+                if attention_mass_values["think_attention_mass"] else None
+            ),
         },
     }
     summary_json_path = output_path.with_name(f"{output_path.stem}_summary.json")

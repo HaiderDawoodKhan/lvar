@@ -7,6 +7,7 @@ from .oracle_mining import (
     split_rationale_into_sentences,
 )
 from .qwen_lvar import QwenLVAR
+from .trace_attention_boost import TraceBoostConfig
 from .rewards import (
     baseline_correctness_reward,
     correctness_reward,
@@ -25,6 +26,7 @@ __all__ = [
     "preprocess_reasoning_steps",
     "split_rationale_into_sentences",
     "QwenLVAR",
+    "TraceBoostConfig",
     "baseline_correctness_reward",
     "correctness_reward",
     "delta_reward",

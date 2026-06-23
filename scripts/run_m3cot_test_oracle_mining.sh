@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -28,6 +27,31 @@ if [[ -n "${LIMIT}" ]]; then
   limit_args=(--limit "${LIMIT}")
 fi
 
+run_one() {
+  local model_key="$1"
+  local checkpoint_path="$2"
+  local context_label="$3"
+  local initial_visual_mode="$4"
+
+  local trace_dir="outputs/oracle_dataset/test/${model_key}_ckpt"
+  local trace_path="${trace_dir}/m3cot_test_traces_${model_key}_${context_label}.jsonl"
+
+  mkdir -p "${trace_dir}"
+
+  echo "Mining ${model_key} checkpoint on M3CoT test with ${context_label} context..."
+  python scripts/mine_phase2.py \
+    --config "${CONFIG}" \
+    --dataset-partition test \
+    --checkpoint-path "${checkpoint_path}" \
+    --initial-visual-mode "${initial_visual_mode}" \
+    --seed "${SEED}" \
+    --output "${trace_path}" \
+    --resume \
+    "${limit_args[@]}"
+
+  eval_mined_traces "${model_key}" "${model_key}" "${checkpoint_path}" "${context_label}"
+}
+
 eval_mined_traces() {
   local mined_by_key="$1"
   local evaluated_by_key="$2"
@@ -43,7 +67,7 @@ eval_mined_traces() {
 
     mkdir -p "${inference_dir}"
 
-    echo "Evaluating ${context_label} ${trace_variant} traces mined by ${mined_by_key} checkpoint using ${evaluated_by_key} checkpoint with entropy tracking..."
+    echo "Evaluating ${context_label} ${trace_variant} traces mined by ${mined_by_key} checkpoint using ${evaluated_by_key} checkpoint..."
     python scripts/eval_mined_traces_m3cot.py \
       --config "${CONFIG}" \
       --dataset-partition test \
@@ -57,16 +81,9 @@ eval_mined_traces() {
   done
 }
 
-eval_mined_traces "ivtlr" "ivtlr" "${IVTLR_CHECKPOINT}" "global"
-eval_mined_traces "ivtlr" "ivtlr" "${IVTLR_CHECKPOINT}" "coarse"
-eval_mined_traces "lvar" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global"
-eval_mined_traces "lvar" "ivtlr" "${IVTLR_CHECKPOINT}" "global"
+run_one "ivtlr" "${IVTLR_CHECKPOINT}" "global" "global"
+run_one "ivtlr" "${IVTLR_CHECKPOINT}" "coarse" "coarse"
+run_one "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global" "global"
+run_one "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse" "coarse"
 
-echo "Running cross-checkpoint oracle-forced evals..."
-eval_mined_traces "lvar" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse"
-eval_mined_traces "lvar" "ivtlr" "${IVTLR_CHECKPOINT}" "coarse"
-eval_mined_traces "ivtlr" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global"
-eval_mined_traces "ivtlr" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse"
-
-echo "Done. Existing trace datasets were read from outputs/oracle_dataset/test. Self and cross evals are under outputs/inference/test_oracle/mined_by_*_ckpt/evaluated_by_*_ckpt."
-echo "Entropy sidecars are written next to each predictions JSONL as *_entropy_tracking.json."
+echo "Done. Trace datasets are under outputs/oracle_dataset/test. Self and cross evals are under outputs/inference/test_oracle/mined_by_*_ckpt/evaluated_by_*_ckpt."

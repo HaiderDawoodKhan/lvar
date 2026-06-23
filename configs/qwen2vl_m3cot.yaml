@@ -13,10 +13,16 @@ model:
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
+  trace_boost:
+    enabled: false
+    target: trace_visual
+    layer_mode: latter_half
+    alpha: 0.2
+    apply_stage: answer_only
   controller_context_window: 3
   use_checkpoint: true
-  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
-  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
 
 dataset:
   type: m3cot
@@ -42,7 +48,7 @@ phase3:
   trace_path: outputs/phase2_m3cot_traces.jsonl
   output_dir: outputs/controller_sft_m3cot
   phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/counterfactual_m3cot/counterfactual_epoch_3.pt"
-  phase3_v2: true
+  phase3_v2: false
   controller_lr: 0.0001
   learning_rate: 0.0001
   weight_decay: 0.0

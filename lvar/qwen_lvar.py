@@ -1,5 +1,6 @@
 import math
-from typing import Any, Dict, Optional, Tuple
+from statistics import mean, median
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from lvar.utils import (
     extract_tagged_answer,
     normalize_action_names,
 )
+from lvar.trace_attention_boost import TraceAttentionBoostRuntime, TraceBoostConfig
 
 try:
     from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
@@ -128,6 +130,7 @@ class QwenLVAR(nn.Module):
         super().__init__()
         # Basic runtime config.
         self.cfg = cfg
+        self.trace_boost_config = TraceBoostConfig.from_value(cfg.get("trace_boost"))
         self.model_id = cfg.get("model_id", "Qwen/Qwen2-VL-2B-Instruct")
         self.device = self._resolve_device(cfg.get("device", "auto"))
         self.dtype = self._resolve_dtype(cfg.get("dtype", "auto"))
@@ -217,6 +220,8 @@ class QwenLVAR(nn.Module):
         self._current_premerge_grid: Optional[Tuple[int, int]] = None
         self._current_postmerge_grid: Optional[Tuple[int, int]] = None
         self._current_image_grid: Optional[Tuple[int, int]] = None
+        self.trace_boost_runtime = TraceAttentionBoostRuntime(self.trace_boost_config)
+        self.trace_boost_runtime.install(self.backbone)
         self.to(self.device)
 
     def _load_processor(self) -> Any:
@@ -250,6 +255,8 @@ class QwenLVAR(nn.Module):
             "trust_remote_code": bool(self.cfg.get("trust_remote_code", True)),
         }
         attn_implementation = self.cfg.get("attn_implementation")
+        if self.trace_boost_config.enabled:
+            attn_implementation = "eager"
         if attn_implementation is not None:
             backbone_kwargs["attn_implementation"] = attn_implementation
         if self.device.type == "cuda":
@@ -633,6 +640,95 @@ class QwenLVAR(nn.Module):
             return tokenizer.decode(token_ids, skip_special_tokens=True)
         return " ".join(str(token_id) for token_id in token_ids)
 
+    def _encode_text_ids(self, text: str) -> torch.Tensor:
+        """Tokenize plain text without special tokens and return a 1D id tensor."""
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None or not callable(tokenizer):
+            raise ValueError("The processor tokenizer is required for entropy tracking.")
+        encoded = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else getattr(encoded, "input_ids", None)
+        if input_ids is None:
+            raise ValueError("Tokenizer output did not include input_ids.")
+        return input_ids.squeeze(0).to(device=self.device, dtype=torch.long)
+
+    def _first_token_id(self, text: str) -> int:
+        token_ids = self._encode_text_ids(text)
+        if token_ids.numel() == 0:
+            raise ValueError(f"Could not tokenize option text: {text!r}")
+        return int(token_ids[0].item())
+
+    def _entropy_from_logits(self, logits: torch.Tensor) -> float:
+        """Compute natural-log entropy over a categorical distribution."""
+        probabilities = torch.softmax(logits.float(), dim=-1)
+        entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum(dim=-1)
+        return float(entropy.squeeze().detach().cpu().item())
+
+    def _aggregate_entropies(self, entropies: List[float]) -> Dict[str, Optional[float]]:
+        if not entropies:
+            return {"mean": None, "median": None, "max": None}
+        return {
+            "mean": float(mean(entropies)),
+            "median": float(median(entropies)),
+            "max": float(max(entropies)),
+        }
+
+    def _answer_option_token_ids(self) -> Dict[str, List[int]]:
+        option_token_ids: Dict[str, List[int]] = {}
+        for option in ("A", "B", "C", "D"):
+            variants = (option, f" {option}", f"{option}.", f" {option}.")
+            ids = {self._first_token_id(variant) for variant in variants}
+            option_token_ids[option] = sorted(ids)
+        return option_token_ids
+
+    def _matched_answer_option(self, token_id: int, option_token_ids: Dict[str, List[int]]) -> Optional[str]:
+        for option, token_ids in option_token_ids.items():
+            if token_id in token_ids:
+                return option
+        return None
+
+    def _answer_option_entropy_from_logits(
+        self,
+        logits: torch.Tensor,
+        option_token_ids: Dict[str, List[int]],
+        selected_token_id: int,
+        decoded_token_index: int,
+    ) -> Dict[str, Any]:
+        """
+        Measure entropy over A/B/C/D from an existing decode-step distribution.
+
+        Per request, option probabilities are extracted from the current token
+        distribution, softmaxed across A-D, and then used for entropy.
+        """
+        selected_option = self._matched_answer_option(selected_token_id, option_token_ids)
+        vocab_probs = torch.softmax(logits.float(), dim=-1).squeeze(0)
+        raw_option_probs = torch.tensor(
+            [
+                float(vocab_probs[token_ids].sum().detach().cpu().item())
+                for token_ids in option_token_ids.values()
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        normalized_option_probs = torch.softmax(raw_option_probs, dim=-1)
+        entropy = -(
+            normalized_option_probs * torch.log(normalized_option_probs.clamp_min(1e-12))
+        ).sum()
+        return {
+            "decoded_token_index": decoded_token_index,
+            "selected_token_id": selected_token_id,
+            "selected_option": selected_option,
+            "option_token_ids": option_token_ids,
+            "raw_option_probabilities": {
+                option: float(probability)
+                for option, probability in zip(option_token_ids.keys(), raw_option_probs.detach().cpu().tolist())
+            },
+            "softmax_option_probabilities": {
+                option: float(probability)
+                for option, probability in zip(option_token_ids.keys(), normalized_option_probs.detach().cpu().tolist())
+            },
+            "entropy": float(entropy.detach().cpu().item()),
+        }
+
     def _select_action(self, type_logits: torch.Tensor, sample_actions: bool) -> Tuple[torch.Tensor, torch.Tensor]:
         """Select hard action ids and return the chosen-action log-prob."""
         distribution = Categorical(logits=type_logits)
@@ -656,6 +752,57 @@ class QwenLVAR(nn.Module):
         probabilities = torch.softmax(logits, dim=-1)
         squeezed = probabilities.squeeze(0)
         return [float(value) for value in squeezed.detach().cpu().tolist()]
+
+    def _controller_head_entropies(
+        self,
+        type_logits: torch.Tensor,
+        region_logits: torch.Tensor,
+        patch_logits: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Measure head and hierarchical joint entropy from selection logits."""
+        action_probs = torch.softmax(type_logits.float(), dim=-1).squeeze(0)
+        action_entropy = self._entropy_from_logits(type_logits)
+        region_entropy = self._entropy_from_logits(region_logits)
+        patch_entropy = self._entropy_from_logits(patch_logits)
+        region_probability = (
+            float(action_probs[self.action_names.index("REGION")].detach().cpu().item())
+            if "REGION" in self.action_names
+            else 0.0
+        )
+        patch_probability = (
+            float(action_probs[self.action_names.index("PATCH")].detach().cpu().item())
+            if "PATCH" in self.action_names
+            else 0.0
+        )
+        controller_entropy = (
+            action_entropy
+            + region_probability * region_entropy
+            + patch_probability * patch_entropy
+        )
+        return {
+            "controller_action_entropy": action_entropy,
+            "controller_region_entropy": region_entropy,
+            "controller_patch_entropy": patch_entropy,
+            "controller_entropy": float(controller_entropy),
+        }
+
+    def _controller_entropy_tracking(self, trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Collect controller-step entropies and aggregate each series."""
+        field_to_prefix = {
+            "controller_action_entropy": "controller_action_entropy",
+            "controller_region_entropy": "controller_region_entropy",
+            "controller_patch_entropy": "controller_patch_entropy",
+            "controller_entropy": "controller_entropy",
+        }
+        tracking: Dict[str, Any] = {}
+        for field, prefix in field_to_prefix.items():
+            values = [float(step[field]) for step in trace if step.get(field) is not None]
+            summary = self._aggregate_entropies(values)
+            tracking[f"{prefix}_values"] = values
+            tracking[f"{prefix}_mean"] = summary["mean"]
+            tracking[f"{prefix}_median"] = summary["median"]
+            tracking[f"{prefix}_max"] = summary["max"]
+        return tracking
 
     def _scale_controller_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply temperature scaling so larger values produce flatter controller distributions."""
@@ -696,8 +843,10 @@ class QwenLVAR(nn.Module):
         self,
         state: Dict[str, Any],
         hidden: torch.Tensor,
+        track_as_think: bool = True,
     ) -> None:
         """Append a recurrent hidden-state token and extend the attention mask."""
+        append_pos = int(state["inputs_embeds"].size(1))
         new_embed = hidden.unsqueeze(1).to(state["inputs_embeds"].dtype)
         state["inputs_embeds"] = torch.cat([state["inputs_embeds"], new_embed], dim=1)
         new_mask = torch.ones(
@@ -706,16 +855,46 @@ class QwenLVAR(nn.Module):
             dtype=state["attention_mask"].dtype,
         )
         state["attention_mask"] = torch.cat([state["attention_mask"], new_mask], dim=1)
+        if track_as_think:
+            state.setdefault("trace_all_positions", []).append(append_pos)
+
+    def _shift_trace_positions_for_insert(
+        self,
+        state: Dict[str, Any],
+        insert_pos: int,
+        num_tokens: int,
+    ) -> None:
+        """Shift tracked absolute positions when tokens are inserted mid-sequence."""
+        for key in ("trace_all_positions", "trace_visual_positions"):
+            positions = state.setdefault(key, [])
+            state[key] = [
+                int(position) + num_tokens if int(position) >= insert_pos else int(position)
+                for position in positions
+            ]
+
+    def _shift_trace_positions_for_drop(self, state: Dict[str, Any], drop_pos: int) -> None:
+        """Remove a dropped position and shift all later trace positions left."""
+        for key in ("trace_all_positions", "trace_visual_positions"):
+            shifted = []
+            for position in state.setdefault(key, []):
+                position = int(position)
+                if position == drop_pos:
+                    continue
+                shifted.append(position - 1 if position > drop_pos else position)
+            state[key] = shifted
 
     def _insert_evidence_token(
         self,
         state: Dict[str, Any],
         evidence_tokens: torch.Tensor,
+        track_as_visual: bool = True,
     ) -> None:
         """Insert projected evidence tokens before the latent token or current final token."""
         projected = evidence_tokens.unsqueeze(0).to(state["inputs_embeds"].dtype)
         num_tokens = projected.size(1)
         insert_pos = state["latent_pos"] if self.use_control_tokens else state["inputs_embeds"].size(1) - 1
+        insert_pos = int(insert_pos)
+        self._shift_trace_positions_for_insert(state, insert_pos, num_tokens)
         prefix = state["inputs_embeds"][:, :insert_pos, :]
         suffix = state["inputs_embeds"][:, insert_pos:, :]
         state["inputs_embeds"] = torch.cat([prefix, projected, suffix], dim=1)
@@ -732,6 +911,12 @@ class QwenLVAR(nn.Module):
         if self.use_control_tokens:
             state["latent_pos"] += num_tokens
             state["act_pos"] += num_tokens
+        if track_as_visual:
+            inserted_positions = list(range(insert_pos, insert_pos + num_tokens))
+            state.setdefault("trace_all_positions", []).extend(inserted_positions)
+            state.setdefault("trace_visual_positions", []).extend(inserted_positions)
+            state["trace_all_positions"] = sorted(set(state["trace_all_positions"]))
+            state["trace_visual_positions"] = sorted(set(state["trace_visual_positions"]))
 
     def prepare_inputs(
         self,
@@ -897,6 +1082,8 @@ class QwenLVAR(nn.Module):
             "attention_mask": attention_mask,
             "latent_pos": latent_pos,
             "act_pos": act_pos,
+            "trace_all_positions": [],
+            "trace_visual_positions": [],
             "trace": [],
             "action_log_probs": [],
             "question": batch.get("question"),
@@ -935,6 +1122,8 @@ class QwenLVAR(nn.Module):
             "attention_mask": attention_mask,
             "latent_pos": latent_pos,
             "act_pos": act_pos,
+            "trace_all_positions": [],
+            "trace_visual_positions": [],
             "trace": [],
             "action_log_probs": [],
             "question": batch.get("question"),
@@ -1137,9 +1326,26 @@ class QwenLVAR(nn.Module):
         scaled_type_logits = self._scale_controller_logits(type_logits)
         scaled_region_logits = self._scale_controller_logits(region_logits)
         scaled_patch_logits = self._scale_controller_logits(patch_logits)
+        if self.mask_immediate_repeats and state.get("last_action") == "REGION":
+            last_region = state.get("last_region_index")
+            if isinstance(last_region, int) and scaled_region_logits.size(-1) > 1:
+                scaled_region_logits = scaled_region_logits.clone()
+                if 0 <= last_region < scaled_region_logits.size(-1):
+                    scaled_region_logits[:, last_region] = torch.finfo(scaled_region_logits.dtype).min
+        if self.mask_immediate_repeats and state.get("last_action") == "PATCH":
+            last_patch = state.get("last_patch_index")
+            if isinstance(last_patch, int) and scaled_patch_logits.size(-1) > 1:
+                scaled_patch_logits = scaled_patch_logits.clone()
+                if 0 <= last_patch < scaled_patch_logits.size(-1):
+                    scaled_patch_logits[:, last_patch] = torch.finfo(scaled_patch_logits.dtype).min
         action_probs = self._distribution_to_list(scaled_type_logits)
         region_probs = self._distribution_to_list(scaled_region_logits)
         patch_probs = self._distribution_to_list(scaled_patch_logits)
+        controller_entropies = self._controller_head_entropies(
+            scaled_type_logits,
+            scaled_region_logits,
+            scaled_patch_logits,
+        )
         action_tensor, action_log_prob = self._select_action(
             scaled_type_logits,
             state.get("sample_actions", False),
@@ -1155,13 +1361,6 @@ class QwenLVAR(nn.Module):
         if action_name == "GLOBAL":
             evidence_token = bank["global"][0].unsqueeze(0)
         elif action_name == "REGION":
-            if self.mask_immediate_repeats and state.get("last_action") == "REGION":
-                last_region = state.get("last_region_index")
-                if isinstance(last_region, int) and scaled_region_logits.size(-1) > 1:
-                    masked = scaled_region_logits.clone()
-                    if 0 <= last_region < masked.size(-1):
-                        masked[:, last_region] = torch.finfo(masked.dtype).min
-                        scaled_region_logits = masked
             region_tensor, region_log_prob = self._select_index(
                 scaled_region_logits,
                 state.get("sample_actions", False),
@@ -1170,13 +1369,6 @@ class QwenLVAR(nn.Module):
             action_log_prob = action_log_prob + region_log_prob
             evidence_token = bank["raw_regions"][region_index]
         elif action_name == "PATCH":
-            if self.mask_immediate_repeats and state.get("last_action") == "PATCH":
-                last_patch = state.get("last_patch_index")
-                if isinstance(last_patch, int) and scaled_patch_logits.size(-1) > 1:
-                    masked = scaled_patch_logits.clone()
-                    if 0 <= last_patch < masked.size(-1):
-                        masked[:, last_patch] = torch.finfo(masked.dtype).min
-                        scaled_patch_logits = masked
             patch_tensor, patch_log_prob = self._select_index(
                 scaled_patch_logits,
                 state.get("sample_actions", False),
@@ -1217,6 +1409,7 @@ class QwenLVAR(nn.Module):
             "action_probs": action_probs,
             "region_probs": region_probs,
             "patch_probs": patch_probs,
+            **controller_entropies,
             "controller_temperature": self.controller_temperature,
             "region_index": region_index,
             "patch_index": patch_index,
@@ -1250,6 +1443,7 @@ class QwenLVAR(nn.Module):
             [state["attention_mask"][:, :act_pos], state["attention_mask"][:, act_pos + 1 :]],
             dim=1,
         )
+        self._shift_trace_positions_for_drop(state, int(act_pos))
         state["act_pos"] = None
         return state
 
@@ -1266,38 +1460,63 @@ class QwenLVAR(nn.Module):
         current_embeds = state["inputs_embeds"]
         current_mask = state["attention_mask"]
         generated_ids = []
+        token_entropies = []
+        option_token_ids = self._answer_option_token_ids()
+        option_entropy = None
 
         # Decode token-by-token with argmax to keep inference deterministic.
-        for _ in range(self.max_answer_tokens):
-            outputs = self.backbone(
-                inputs_embeds=current_embeds,
-                attention_mask=current_mask,
-                output_hidden_states=False,
-                return_dict=True,
-                use_cache=False,
-            )
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
-            token_id = int(next_token.item())
-            if self.eos_token_id is not None and token_id == self.eos_token_id:
-                break
-            generated_ids.append(token_id)
-            # Feed generated token back into the running prefix.
-            next_embed = self._embed_input_ids(next_token.unsqueeze(1))
-            current_embeds = torch.cat([current_embeds, next_embed], dim=1)
-            current_mask = torch.cat(
-                [
-                    current_mask,
-                    torch.ones((1, 1), device=self.device, dtype=current_mask.dtype),
-                ],
-                dim=1,
-            )
+        with self.trace_boost_runtime.answer_decode(
+            state.get("trace_all_positions", []),
+            state.get("trace_visual_positions", []),
+            answer_query_start=decode_prefix_length - 1,
+        ):
+            for decoded_token_index in range(self.max_answer_tokens):
+                outputs = self.backbone(
+                    inputs_embeds=current_embeds,
+                    attention_mask=current_mask,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    use_cache=False,
+                )
+                next_token_logits = outputs.logits[:, -1, :]
+                next_token = torch.argmax(next_token_logits, dim=-1)
+                token_id = int(next_token.item())
+                if self.eos_token_id is not None and token_id == self.eos_token_id:
+                    break
+                token_entropies.append(self._entropy_from_logits(next_token_logits))
+                if option_entropy is None and self._matched_answer_option(token_id, option_token_ids) is not None:
+                    option_entropy = self._answer_option_entropy_from_logits(
+                        next_token_logits,
+                        option_token_ids,
+                        selected_token_id=token_id,
+                        decoded_token_index=decoded_token_index,
+                    )
+                generated_ids.append(token_id)
+                # Feed generated token back into the running prefix.
+                next_embed = self._embed_input_ids(next_token.unsqueeze(1))
+                current_embeds = torch.cat([current_embeds, next_embed], dim=1)
+                current_mask = torch.cat(
+                    [
+                        current_mask,
+                        torch.ones((1, 1), device=self.device, dtype=current_mask.dtype),
+                    ],
+                    dim=1,
+                )
 
         generated_tensor = torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         generated_text = self._decode_ids(generated_tensor.cpu()) if generated_ids else ""
+        token_entropy_summary = self._aggregate_entropies(token_entropies)
+        attention_mass_summary = self.trace_boost_runtime.attention_mass_summary()
         return {
             "generated_ids": generated_ids,
             "generated_text": generated_text,
             "answer": extract_tagged_answer(generated_text),
+            "token_entropies": token_entropies,
+            "token_entropy_mean": token_entropy_summary["mean"],
+            "token_entropy_median": token_entropy_summary["median"],
+            "token_entropy_max": token_entropy_summary["max"],
+            "answer_option_entropy": option_entropy,
+            **attention_mass_summary,
             "decode_prefix_length": decode_prefix_length,
             "final_sequence_length": current_embeds.size(1),
             "final_inputs_embeds": current_embeds,
@@ -1316,6 +1535,8 @@ class QwenLVAR(nn.Module):
             "attention_mask": state["attention_mask"].detach(),
             "latent_pos": state.get("latent_pos"),
             "act_pos": state.get("act_pos"),
+            "trace_all_positions": list(state.get("trace_all_positions", [])),
+            "trace_visual_positions": list(state.get("trace_visual_positions", [])),
         }
 
     def forward(
@@ -1366,10 +1587,21 @@ class QwenLVAR(nn.Module):
         action_log_prob_sum = None
         if state["action_log_probs"]:
             action_log_prob_sum = torch.stack(state["action_log_probs"]).sum()
+        controller_entropy_tracking = self._controller_entropy_tracking(state["trace"])
         return {
             "answer": decoded["answer"],
             "generated_text": decoded["generated_text"],
             "generated_ids": decoded["generated_ids"],
+            "token_entropies": decoded.get("token_entropies", []),
+            "token_entropy_mean": decoded.get("token_entropy_mean"),
+            "token_entropy_median": decoded.get("token_entropy_median"),
+            "token_entropy_max": decoded.get("token_entropy_max"),
+            "answer_option_entropy": decoded.get("answer_option_entropy"),
+            "trace_attention_mass": decoded.get("trace_attention_mass"),
+            "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
+            "think_attention_mass": decoded.get("think_attention_mass"),
+            "trace_boost_attention_observations": decoded.get("trace_boost_attention_observations", 0),
+            "trace_boost_softmax_hits": decoded.get("trace_boost_softmax_hits", 0),
             "trace": state["trace"],
             "num_steps": len(state["trace"]),
             "stopped": stopped,
@@ -1377,6 +1609,7 @@ class QwenLVAR(nn.Module):
             "final_sequence_length": decoded["final_sequence_length"],
             "action_log_probs": state["action_log_probs"],
             "action_log_prob_sum": action_log_prob_sum,
+            **controller_entropy_tracking,
         }
 
     def baseline_forward(
@@ -1395,12 +1628,22 @@ class QwenLVAR(nn.Module):
             "attention_mask": attention_mask,
             "latent_pos": None,
             "act_pos": None,
+            "trace_all_positions": [],
+            "trace_visual_positions": [],
         }
         decoded = self.decode_answer(state, labels=labels)
         return {
             "answer": decoded["answer"],
             "generated_text": decoded["generated_text"],
             "generated_ids": decoded["generated_ids"],
+            "token_entropies": decoded.get("token_entropies", []),
+            "token_entropy_mean": decoded.get("token_entropy_mean"),
+            "token_entropy_median": decoded.get("token_entropy_median"),
+            "token_entropy_max": decoded.get("token_entropy_max"),
+            "answer_option_entropy": decoded.get("answer_option_entropy"),
+            "trace_attention_mass": decoded.get("trace_attention_mass"),
+            "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
+            "think_attention_mass": decoded.get("think_attention_mass"),
             "trace": [],
             "num_steps": 0,
             "decode_prefix_length": decoded["decode_prefix_length"],
@@ -1485,6 +1728,16 @@ class QwenLVAR(nn.Module):
             "num_steps": output["num_steps"],
             "generated_text": output["generated_text"],
             "generated_ids": output["generated_ids"],
+            "token_entropies": output.get("token_entropies", []),
+            "token_entropy_mean": output.get("token_entropy_mean"),
+            "token_entropy_median": output.get("token_entropy_median"),
+            "token_entropy_max": output.get("token_entropy_max"),
+            "answer_option_entropy": output.get("answer_option_entropy"),
+            **{
+                key: value
+                for key, value in output.items()
+                if key.startswith("controller_") and "temperature" not in key
+            },
         }
 
     def generate_baseline(self, images: Any, questions: Any) -> Dict[str, Any]:
