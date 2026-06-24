@@ -39,7 +39,7 @@ run_one() {
   mkdir -p "${trace_dir}"
 
   echo "Mining ${model_key} checkpoint on M3CoT test with ${context_label} context..."
-  python scripts/mine_phase2.py \
+  python lvar_scripts/mine_phase2.py \
     --config "${CONFIG}" \
     --dataset-partition test \
     --checkpoint-path "${checkpoint_path}" \
@@ -68,7 +68,7 @@ eval_mined_traces() {
     mkdir -p "${inference_dir}"
 
     echo "Evaluating ${context_label} ${trace_variant} traces mined by ${mined_by_key} checkpoint using ${evaluated_by_key} checkpoint..."
-    python scripts/eval_mined_traces_m3cot.py \
+    python lvar_scripts/eval_mined_traces_m3cot.py \
       --config "${CONFIG}" \
       --dataset-partition test \
       --checkpoint-path "${evaluator_checkpoint_path}" \

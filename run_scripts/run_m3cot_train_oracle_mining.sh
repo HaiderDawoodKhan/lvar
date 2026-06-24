@@ -39,7 +39,7 @@ run_one() {
   mkdir -p "${trace_dir}"
 
   echo "Mining ${model_key} checkpoint on M3CoT train with ${context_label} context..."
-  python scripts/mine_phase2.py \
+  python lvar_scripts/mine_phase2.py \
     --config "${CONFIG}" \
     --dataset-partition train \
     --checkpoint-path "${checkpoint_path}" \

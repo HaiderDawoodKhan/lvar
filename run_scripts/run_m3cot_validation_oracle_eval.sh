@@ -44,7 +44,7 @@ eval_mined_traces() {
     mkdir -p "${inference_dir}"
 
     echo "Evaluating ${context_label} ${trace_variant} traces mined by ${mined_by_key} checkpoint using ${evaluated_by_key} checkpoint with entropy tracking..."
-    python scripts/eval_mined_traces_m3cot.py \
+    python lvar_scripts/eval_mined_traces_m3cot.py \
       --config "${CONFIG}" \
       --dataset-partition validation \
       --checkpoint-path "${evaluator_checkpoint_path}" \

@@ -37,7 +37,7 @@ eval_visual_index_modes() {
 
     mkdir -p "${inference_dir}"
     echo "Evaluating ${model_key} ${context_label} trace with visual-index mode ${visual_index_mode}..."
-    python scripts/eval_mined_traces_m3cot.py \
+    python lvar_scripts/eval_mined_traces_m3cot.py \
       --config "${CONFIG}" \
       --dataset-partition test \
       --checkpoint-path "${checkpoint_path}" \

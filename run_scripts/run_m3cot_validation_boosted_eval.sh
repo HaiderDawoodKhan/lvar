@@ -24,7 +24,7 @@ run_full_lvar() {
 
   mkdir -p "${inference_dir}"
   echo "Running full LVAR pipeline: target=${target}, layers=${layer_mode}, alpha=${alpha}"
-  python scripts/infer_lvar_m3cot.py \
+  python lvar_scripts/infer_lvar_m3cot.py \
     --config "${CONFIG}" \
     --phase4-vlm-checkpoint-path "${PHASE4_VLM_CHECKPOINT}" \
     --controller-checkpoint-path "${CONTROLLER_CHECKPOINT}" \
@@ -55,7 +55,7 @@ eval_mined_trace_setting() {
   fi
   mkdir -p "${inference_dir}"
   echo "Evaluating raw ${context_label} traces mined by ${mined_by_key} with ${evaluated_by_key}: target=${target}, layers=${layer_mode}, alpha=${alpha}"
-  python scripts/eval_mined_traces_m3cot.py \
+  python lvar_scripts/eval_mined_traces_m3cot.py \
     --config "${CONFIG}" \
     --dataset-partition validation \
     --checkpoint-path "${evaluator_checkpoint_path}" \
