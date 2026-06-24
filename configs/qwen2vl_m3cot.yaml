@@ -8,6 +8,11 @@ model:
   action_selection: sample
   controller_temperature: 1.0
   controller_index_temperature: 0.07
+  nucleus_insertion_enabled: false
+  # patch, region, or both
+  nucleus_insertion_scope: both
+  nucleus_insertion_top_p: 0.9
+  nucleus_insertion_max_indices: 4
   controller_num_regions: 25
   controller_num_patches: 100
   pooling: mean
@@ -68,10 +73,16 @@ phase3:
   max_primitive_actions_per_example: 8
   no_op_stop_ce_threshold: 0.05
   visual_block_dropout_p: 0.05
+  multi_hot_patch_labels: false
+  # binary: BCE against 1s at every selected patch; ordered: rank-decayed soft target.
+  multi_hot_patch_target_mode: binary
+  multi_hot_patch_order_decay: 0.5
+  use_type_loss_weights: true
   type_loss_weights:
     PATCH: 1.0
     REGION: 2.5
     THINK: 5.0
+    GLOBAL: 1.0
     STOP: 5.0
 
 phase4:
@@ -156,6 +167,12 @@ inference:
   limit:
   output_path: outputs/m3cot_lvar_predictions.jsonl
   dataset_partition: test
+  # Optional oracle-replay diagnostics. Both are disabled by default.
+  track_step_hidden_entropy: false
+  # Set to a positive integer (for example 50) to renormalize over only top-k tokens.
+  # Leave null to compute full-vocabulary next-token entropy.
+  step_entropy_top_k:
+  track_prefix_rollouts: false
   controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   action_selection: argmax
   mask_immediate_repeats: true

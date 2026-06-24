@@ -129,6 +129,58 @@ def compute_action_loss(
     return loss
 
 
+def compute_patch_sequence_loss(
+    type_logits: torch.Tensor,
+    patch_logits: torch.Tensor,
+    actions: Iterable[Dict[str, Any]],
+    target_mode: str = "binary",
+    order_decay: float = 0.5,
+    type_loss_weights: Optional[Dict[str, float]] = None,
+    action_name_to_id: Optional[Dict[str, int]] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor | str]]:
+    """Compute one controller target for an ordered sequence of patch indices."""
+    patch_actions = list(actions)
+    if len(patch_actions) < 2 or any(str(action.get("type", "")).upper() != "PATCH" for action in patch_actions):
+        raise ValueError("Multi-hot patch supervision requires at least two PATCH actions.")
+    mode = str(target_mode).strip().lower()
+    if mode not in {"binary", "ordered"}:
+        raise ValueError("multi_hot_patch_target_mode must be 'binary' or 'ordered'.")
+    if order_decay <= 0.0 or order_decay > 1.0:
+        raise ValueError("multi_hot_patch_order_decay must be in (0, 1].")
+
+    device = type_logits.device
+    action_ids = action_name_to_id if action_name_to_id is not None else ACTION_NAME_TO_ID
+    target_type = torch.tensor([action_ids["PATCH"]], device=device, dtype=torch.long)
+    raw_type_loss = F.cross_entropy(type_logits, target_type)
+    type_weight = float((type_loss_weights or DEFAULT_TYPE_LOSS_WEIGHTS).get("PATCH", 1.0))
+    type_loss = raw_type_loss * type_weight
+
+    patch_indices = [int(action["patch_idx"]) for action in patch_actions]
+    if any(index < 0 or index >= patch_logits.size(-1) for index in patch_indices):
+        raise ValueError(f"Patch sequence contains an index outside [0, {patch_logits.size(-1) - 1}].")
+    patch_target = torch.zeros_like(patch_logits, dtype=torch.float32)
+    if mode == "binary":
+        patch_target[0, patch_indices] = 1.0
+        patch_loss = F.binary_cross_entropy_with_logits(patch_logits.float(), patch_target)
+    else:
+        for rank, patch_index in enumerate(patch_indices):
+            patch_target[0, patch_index] += float(order_decay) ** rank
+        patch_target = patch_target / patch_target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        patch_loss = -(patch_target * F.log_softmax(patch_logits.float(), dim=-1)).sum(dim=-1).mean()
+
+    loss = type_loss + patch_loss
+    zero = torch.zeros((), device=device, dtype=loss.dtype)
+    return loss, {
+        "action_type": "PATCH",
+        "total_loss": loss,
+        "type_loss": type_loss,
+        "raw_type_loss": raw_type_loss,
+        "patch_loss": patch_loss,
+        "region_loss": zero,
+        "patch_target_mode": mode,
+    }
+
+
 def _decision_improvement(decision: Dict[str, Any]) -> float:
     if "improvement" in decision:
         return float(decision.get("improvement") or 0.0)
@@ -331,12 +383,19 @@ def replay_controller_sft_loss(
     no_op_stop_ce_threshold: float = 0.05,
     remove_global: bool = False,
     visual_block_dropout_p: float = 0.0,
+    multi_hot_patch_labels: bool = False,
+    multi_hot_patch_target_mode: str = "binary",
+    multi_hot_patch_order_decay: float = 0.5,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Replay mined decisions and return the mean controller SFT loss."""
     if full_context_probability < 0.0 or full_context_probability > 1.0:
         raise ValueError("full_context_probability must be in [0, 1].")
     if visual_block_dropout_p < 0.0 or visual_block_dropout_p > 1.0:
         raise ValueError("visual_block_dropout_p must be in [0, 1].")
+    if str(multi_hot_patch_target_mode).strip().lower() not in {"binary", "ordered"}:
+        raise ValueError("multi_hot_patch_target_mode must be 'binary' or 'ordered'.")
+    if multi_hot_patch_order_decay <= 0.0 or multi_hot_patch_order_decay > 1.0:
+        raise ValueError("multi_hot_patch_order_decay must be in (0, 1].")
     sampler = rng or random
     use_full_context = sampler.random() < full_context_probability
     state, bank = prepare_controller_sft_state(
@@ -359,6 +418,9 @@ def replay_controller_sft_loss(
     controller_step = 0
     action_name_to_id = getattr(model, "action_name_to_id", None)
     transform_metrics: Dict[str, Any] = {}
+    primitive_target_count = 0
+    multi_hot_patch_blocks = 0
+    multi_hot_patch_indices = 0
 
     def record_step_metrics(
         type_logits: torch.Tensor,
@@ -418,7 +480,45 @@ def replay_controller_sft_loss(
         if not actions:
             continue
         block_losses: List[torch.Tensor] = []
-        for action in actions:
+        action_cursor = 0
+        while action_cursor < len(actions):
+            action = actions[action_cursor]
+            patch_run = []
+            if multi_hot_patch_labels and str(action.get("type", "")).upper() == "PATCH":
+                run_cursor = action_cursor
+                while (
+                    run_cursor < len(actions)
+                    and str(actions[run_cursor].get("type", "")).upper() == "PATCH"
+                ):
+                    patch_run.append(actions[run_cursor])
+                    run_cursor += 1
+            if len(patch_run) > 1:
+                type_logits, region_logits, patch_logits = model.controller_logits_from_state(
+                    state,
+                    bank,
+                    controller_step,
+                )
+                loss, components = compute_patch_sequence_loss(
+                    type_logits,
+                    patch_logits,
+                    patch_run,
+                    target_mode=multi_hot_patch_target_mode,
+                    order_decay=multi_hot_patch_order_decay,
+                    type_loss_weights=type_loss_weights,
+                    action_name_to_id=action_name_to_id,
+                )
+                block_losses.append(loss)
+                action_counts["PATCH"] += 1
+                primitive_target_count += len(patch_run)
+                multi_hot_patch_blocks += 1
+                multi_hot_patch_indices += len(patch_run)
+                record_step_metrics(type_logits, region_logits, patch_logits, components)
+                with torch.no_grad():
+                    model.apply_mined_actions(state, bank, patch_run)
+                controller_step += 1
+                action_cursor += len(patch_run)
+                continue
+
             type_logits, region_logits, patch_logits = model.controller_logits_from_state(
                 state,
                 bank,
@@ -434,12 +534,14 @@ def replay_controller_sft_loss(
                 action_name_to_id=action_name_to_id,
             )
             block_losses.append(loss)
+            primitive_target_count += 1
             action_counts[str(components["action_type"])] += 1
             record_step_metrics(type_logits, region_logits, patch_logits, components)
             if str(components["action_type"]) != "STOP":
                 with torch.no_grad():
                     model.apply_mined_actions(state, bank, [action])
                 controller_step += 1
+            action_cursor += 1
         if block_losses:
             if decision_block_normalized:
                 losses.append(torch.stack(block_losses).mean())
@@ -452,7 +554,7 @@ def replay_controller_sft_loss(
     metrics = {
         "example_id": mined_row.get("example_id"),
         "num_targets": len(losses),
-        "num_primitive_targets": sum(action_counts.values()),
+        "num_primitive_targets": primitive_target_count,
         "num_controller_steps": sum(action_counts.values()),
         "skipped_noop_decisions": skipped_noop,
         "dropped_visual_blocks": dropped_visual_blocks,
@@ -466,6 +568,11 @@ def replay_controller_sft_loss(
         "initial_visual_mode": "full_context" if use_full_context else "global_mean",
         "used_full_context": use_full_context,
         "decision_block_normalized": decision_block_normalized,
+        "multi_hot_patch_labels": bool(multi_hot_patch_labels),
+        "multi_hot_patch_target_mode": str(multi_hot_patch_target_mode).strip().lower(),
+        "multi_hot_patch_order_decay": float(multi_hot_patch_order_decay),
+        "multi_hot_patch_blocks": multi_hot_patch_blocks,
+        "multi_hot_patch_indices": multi_hot_patch_indices,
         "transform": transform_metrics,
     }
     return torch.stack(losses).mean(), metrics

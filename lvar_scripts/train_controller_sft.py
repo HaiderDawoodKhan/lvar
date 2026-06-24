@@ -120,8 +120,11 @@ def main() -> None:
     if full_context_probability < 0.0 or full_context_probability > 1.0:
         raise ValueError("phase3.full_context_probability must be in [0, 1].")
     decision_block_normalized = bool(phase3_cfg.get("decision_block_normalized", phase3_v2))
-    type_loss_weights = dict(PHASE3_V2_TYPE_LOSS_WEIGHTS if phase3_v2 else {})
-    type_loss_weights.update(phase3_cfg.get("type_loss_weights", {}) or {})
+    use_type_loss_weights = bool(phase3_cfg.get("use_type_loss_weights", phase3_v2))
+    type_loss_weights = {}
+    if use_type_loss_weights:
+        type_loss_weights = dict(PHASE3_V2_TYPE_LOSS_WEIGHTS if phase3_v2 else {})
+        type_loss_weights.update(phase3_cfg.get("type_loss_weights", {}) or {})
     visual_or_region_min_improvement = float(phase3_cfg.get("visual_or_region_min_improvement", 0.05))
     think_min_improvement = float(phase3_cfg.get("think_min_improvement", 0.03))
     max_decision_blocks = int(phase3_cfg.get("max_decision_blocks_per_example", 6))
@@ -129,6 +132,9 @@ def main() -> None:
     no_op_stop_ce_threshold = float(phase3_cfg.get("no_op_stop_ce_threshold", 0.05))
     remove_global = bool(phase3_cfg.get("remove_global", phase3_v2))
     visual_block_dropout_p = float(phase3_cfg.get("visual_block_dropout_p", 0.0))
+    multi_hot_patch_labels = bool(phase3_cfg.get("multi_hot_patch_labels", False))
+    multi_hot_patch_target_mode = str(phase3_cfg.get("multi_hot_patch_target_mode", "binary"))
+    multi_hot_patch_order_decay = float(phase3_cfg.get("multi_hot_patch_order_decay", 0.5))
     context_rng = random.Random(seed)
 
     global_step = 0
@@ -143,8 +149,12 @@ def main() -> None:
     logit_stat_counts: Counter[str] = Counter()
     transform_totals: Counter[str] = Counter()
     skipped_block_totals: Counter[str] = Counter()
+    multi_hot_totals: Counter[str] = Counter()
     loss_total = 0.0
     trained_examples = 0
+    loss_history_path = output_dir / "controller_sft_losses.jsonl"
+    # Line buffering preserves completed-step losses even if a long run is interrupted.
+    loss_history_handle = open(loss_history_path, "w", encoding="utf-8", buffering=1)
 
     for epoch in range(num_epochs):
         progress = tqdm(
@@ -178,6 +188,9 @@ def main() -> None:
                 no_op_stop_ce_threshold=no_op_stop_ce_threshold,
                 remove_global=remove_global,
                 visual_block_dropout_p=visual_block_dropout_p,
+                multi_hot_patch_labels=multi_hot_patch_labels,
+                multi_hot_patch_target_mode=multi_hot_patch_target_mode,
+                multi_hot_patch_order_decay=multi_hot_patch_order_decay,
             )
             loss.backward()
             if grad_clip_norm > 0:
@@ -188,6 +201,21 @@ def main() -> None:
             trained_examples += 1
             loss_value = float(loss.detach().item())
             loss_total += loss_value
+            loss_components = metrics.get("loss_components", {})
+            loss_history_handle.write(
+                json.dumps(
+                    {
+                        "global_step": global_step,
+                        "epoch": epoch + 1,
+                        "example_id": example_id,
+                        "total_loss": loss_value,
+                        "action_loss": float(loss_components.get("type_loss", 0.0)),
+                        "region_loss": float(loss_components.get("region_loss", 0.0)),
+                        "patch_loss": float(loss_components.get("patch_loss", 0.0)),
+                    }
+                )
+                + "\n"
+            )
             action_totals.update(metrics["action_counts"])
             initial_visual_totals.update([metrics["initial_visual_mode"]])
             update_weighted_means(
@@ -213,6 +241,8 @@ def main() -> None:
                 transform_totals[key] += int(transform.get(key, 0))
             transform_totals["dropped_visual_blocks"] += int(metrics.get("dropped_visual_blocks", 0))
             skipped_block_totals.update(transform.get("skipped_blocks", {}) or {})
+            multi_hot_totals["patch_blocks"] += int(metrics.get("multi_hot_patch_blocks", 0))
+            multi_hot_totals["patch_indices"] += int(metrics.get("multi_hot_patch_indices", 0))
             mean_components = finalize_weighted_means(loss_component_totals, loss_component_counts)
             mean_loss = loss_total / max(1, trained_examples)
             progress.set_postfix(
@@ -258,8 +288,14 @@ def main() -> None:
                 "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
                 "phase3_v2": phase3_v2,
                 "decision_block_normalized": decision_block_normalized,
+                "use_type_loss_weights": use_type_loss_weights,
                 "type_loss_weights": type_loss_weights,
+                "loss_history_path": str(loss_history_path),
                 "visual_block_dropout_p": visual_block_dropout_p,
+                "multi_hot_patch_labels": multi_hot_patch_labels,
+                "multi_hot_patch_target_mode": multi_hot_patch_target_mode,
+                "multi_hot_patch_order_decay": multi_hot_patch_order_decay,
+                "multi_hot_totals": dict(multi_hot_totals),
                 "transform_totals": dict(transform_totals),
                 "skipped_block_totals": dict(skipped_block_totals),
                 "action_names": model.action_names,
@@ -272,6 +308,7 @@ def main() -> None:
             tqdm.write(f"Saved Phase 3 epoch checkpoint to {epoch_checkpoint_path}")
 
     if trained_examples == 0:
+        loss_history_handle.close()
         raise ValueError(
             "No mined rows matched the source dataset by example_id; "
             "check phase3.dataset_partition/dataset_limit and the trace file."
@@ -294,8 +331,14 @@ def main() -> None:
         "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
         "phase3_v2": phase3_v2,
         "decision_block_normalized": decision_block_normalized,
+        "use_type_loss_weights": use_type_loss_weights,
         "type_loss_weights": type_loss_weights,
+        "loss_history_path": str(loss_history_path),
         "visual_block_dropout_p": visual_block_dropout_p,
+        "multi_hot_patch_labels": multi_hot_patch_labels,
+        "multi_hot_patch_target_mode": multi_hot_patch_target_mode,
+        "multi_hot_patch_order_decay": multi_hot_patch_order_decay,
+        "multi_hot_totals": dict(multi_hot_totals),
         "transform_totals": dict(transform_totals),
         "skipped_block_totals": dict(skipped_block_totals),
         "action_names": model.action_names,
@@ -308,8 +351,10 @@ def main() -> None:
     save_controller_sft_checkpoint(model, checkpoint_path, metadata=metadata)
     with open(output_dir / "controller_sft_summary.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
+    loss_history_handle.close()
     print(f"Saved Phase 3 controller SFT checkpoint to {checkpoint_path}")
     print(f"Saved Phase 3 summary to {output_dir / 'controller_sft_summary.json'}")
+    print(f"Saved Phase 3 loss history to {loss_history_path}")
 
 
 if __name__ == "__main__":

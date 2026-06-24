@@ -115,6 +115,16 @@ def main() -> None:
     parser.add_argument("--phase4-vlm-checkpoint-path", default=None)
     parser.add_argument("--controller-checkpoint-path", default=None)
     parser.add_argument("--use-coarse-context", action="store_true", default=False)
+    parser.add_argument(
+        "--nucleus-insertion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Insert the complete top-p patch/region nucleus for each selected visual action.",
+    )
+    parser.add_argument("--nucleus-insertion-scope", choices=["patch", "region", "both"], default=None)
+    parser.add_argument("--nucleus-insertion-top-p", type=float, default=None)
+    parser.add_argument("--nucleus-insertion-max-indices", type=int, default=None)
+    parser.add_argument("--use_validation_set", action="store_true", help="Use validation set for inference")
     add_model_loading_args(parser)
     add_trace_boost_args(parser)
     args = parser.parse_args()
@@ -132,8 +142,25 @@ def main() -> None:
         config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in inference_cfg:
         config["model"]["mask_immediate_repeats"] = bool(inference_cfg["mask_immediate_repeats"])
+    for key in (
+        "nucleus_insertion_enabled",
+        "nucleus_insertion_scope",
+        "nucleus_insertion_top_p",
+        "nucleus_insertion_max_indices",
+    ):
+        if key in inference_cfg:
+            config["model"][key] = inference_cfg[key]
+    if args.nucleus_insertion is not None:
+        config["model"]["nucleus_insertion_enabled"] = bool(args.nucleus_insertion)
+    if args.nucleus_insertion_scope is not None:
+        config["model"]["nucleus_insertion_scope"] = args.nucleus_insertion_scope
+    if args.nucleus_insertion_top_p is not None:
+        config["model"]["nucleus_insertion_top_p"] = args.nucleus_insertion_top_p
+    if args.nucleus_insertion_max_indices is not None:
+        config["model"]["nucleus_insertion_max_indices"] = args.nucleus_insertion_max_indices
 
     dataset_partition = inference_cfg.get("dataset_partition", "test")
+    dataset_partition = "validation" if args.use_validation_set else dataset_partition
     split_seed = int(inference_cfg.get("split_seed", dataset_cfg.get("split_seed", train_cfg.get("seed", 42))))
     test_fraction = float(inference_cfg.get("test_fraction", dataset_cfg.get("test_fraction", 0.1)))
 
@@ -218,8 +245,13 @@ def main() -> None:
             }
             if step.get("region_index") is not None:
                 step_info["region_index"] = step["region_index"]
+            if step.get("region_indices"):
+                step_info["region_indices"] = step["region_indices"]
             if step.get("patch_index") is not None:
                 step_info["patch_index"] = step["patch_index"]
+            if step.get("patch_indices"):
+                step_info["patch_indices"] = step["patch_indices"]
+            step_info["nucleus_insertion_applied"] = bool(step.get("nucleus_insertion_applied", False))
             step_info["sequence_length_before"] = step["sequence_length_before"]
             step_info["sequence_length_after"] = step["sequence_length_after"]
             tracing.append(step_info)
@@ -277,6 +309,12 @@ def main() -> None:
         "phase4_vlm_checkpoint": phase4_vlm_checkpoint_path,
         "controller_checkpoint": controller_checkpoint_path,
         "trace_boost": model.trace_boost_config.to_dict(),
+        "nucleus_insertion": {
+            "enabled": model.nucleus_insertion_enabled,
+            "scope": model.nucleus_insertion_scope,
+            "top_p": model.nucleus_insertion_top_p,
+            "max_indices": model.nucleus_insertion_max_indices,
+        },
         "entropy_tracking_path": str(entropy_path),
         "metrics": {
             "total": total,

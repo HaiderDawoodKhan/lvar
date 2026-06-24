@@ -49,10 +49,9 @@ run_one() {
     --resume \
     "${limit_args[@]}"
 
-  eval_mined_traces "${model_key}" "${model_key}" "${checkpoint_path}" "${context_label}"
 }
 
-run_one "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global" "global"
+# run_one "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global" "global"
 run_one "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse" "coarse"
 
 echo "Done. Trace datasets are under outputs/oracle_dataset/validation."

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
+IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
 LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
@@ -59,3 +60,7 @@ eval_mined_traces() {
 
 eval_mined_traces "lvar" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global"
 eval_mined_traces "lvar" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse"
+
+
+eval_mined_traces "lvar" "ivtlr" "${IVTLR_CHECKPOINT}" "global"
+eval_mined_traces "lvar" "ivtlr" "${IVTLR_CHECKPOINT}" "coarse"
