@@ -679,6 +679,51 @@ class QwenLVARTests(unittest.TestCase):
         self.assertIn("raw_regions", bank)
         self.assertEqual(tuple(bank["raw_regions"].shape), (1, 4, 4))
 
+    def test_patch_nucleus_insertion_adds_top_p_set_in_one_controller_step(self):
+        model = build_model(
+            controller_context_window=1,
+            controller_num_regions=4,
+            controller_num_patches=4,
+            nucleus_insertion_enabled=True,
+            nucleus_insertion_scope="patch",
+            nucleus_insertion_top_p=0.8,
+            nucleus_insertion_max_indices=4,
+        )
+        model.eval()
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = projected
+        bank = model.build_visual_bank(projected)
+        state = model.build_initial_state(prepared)
+        initial_length = state["inputs_embeds"].size(1)
+
+        def forward(state_hidden, step_hidden, bank, act_hidden=None):
+            del state_hidden, step_hidden, act_hidden
+            type_logits = torch.full((1, 5), -10.0)
+            type_logits[0, ACTION_PATCH] = 10.0
+            region_logits = torch.zeros(1, bank["regions"].size(0))
+            patch_logits = torch.tensor([[3.0, 2.0, -10.0, -10.0]])
+            return type_logits, region_logits, patch_logits
+
+        model.controller.forward = forward
+        updated_state, action_id, should_stop, step_trace = model.forward_reasoning_step(state, bank, 0)
+
+        self.assertEqual(action_id, ACTION_PATCH)
+        self.assertFalse(should_stop)
+        self.assertEqual(step_trace["patch_indices"], [0, 1])
+        self.assertEqual(step_trace["patch_index"], 0)
+        self.assertTrue(step_trace["nucleus_insertion_applied"])
+        self.assertEqual(updated_state["inputs_embeds"].size(1), initial_length + 2)
+
+    def test_nucleus_scope_can_exclude_region_actions(self):
+        model = build_model(
+            nucleus_insertion_enabled=True,
+            nucleus_insertion_scope="patch",
+        )
+        model.eval()
+
+        self.assertTrue(model._nucleus_insertion_applies("patch"))
+        self.assertFalse(model._nucleus_insertion_applies("region"))
 
 if __name__ == "__main__":
     unittest.main()

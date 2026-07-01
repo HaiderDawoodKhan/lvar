@@ -8,6 +8,8 @@ PHASE4_VLM_CHECKPOINT="${PHASE4_VLM_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/q
 CONTROLLER_CHECKPOINT="${CONTROLLER_CHECKPOINT:-/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
+GLOBAL_REPLAY_CONTEXT="${GLOBAL_REPLAY_CONTEXT:-global}"
+COARSE_REPLAY_CONTEXT="${COARSE_REPLAY_CONTEXT:-coarse}"
 
 for checkpoint in \
   "${IVTLR_CHECKPOINT}" \
@@ -57,8 +59,8 @@ run_full_lvar() {
   echo "Running full LVAR pipeline: target=${target}, layers=${layer_mode}, alpha=${alpha}"
   python lvar_scripts/infer_lvar_m3cot.py \
     --config "${CONFIG}" \
-    --phase4-vlm-checkpoint-path "${PHASE4_VLM_CHECKPOINT}" \
-    --controller-checkpoint-path "${CONTROLLER_CHECKPOINT}" \
+    --vlm-path "${PHASE4_VLM_CHECKPOINT}" \
+    --controller-path "${CONTROLLER_CHECKPOINT}" \
     --trace-boost \
     --trace-boost-target "${target}" \
     --trace-boost-layer-mode "${layer_mode}" \
@@ -75,10 +77,14 @@ eval_mined_trace_setting() {
   local target="$5"
   local layer_mode="$6"
   local alpha="$7"
+  local replay_context_label="${GLOBAL_REPLAY_CONTEXT}"
+  if [[ "${context_label}" == "coarse" ]]; then replay_context_label="${COARSE_REPLAY_CONTEXT}"; fi
+  local replay_suffix=""
+  if [[ "${replay_context_label}" != "${context_label}" ]]; then replay_suffix="_replayed-under_${replay_context_label}"; fi
 
   local trace_path="outputs/oracle_dataset/test/${mined_by_key}_ckpt/m3cot_test_traces_${mined_by_key}_${context_label}.jsonl"
   local inference_dir="outputs/inference/test_oracle_boosted/mined_by_${mined_by_key}_ckpt/evaluated_by_${evaluated_by_key}_ckpt/trace_variant_raw/target_${target}/layers_${layer_mode}/alpha_${alpha}"
-  local output_path="${inference_dir}/m3cot_test_predictions_mined-by_${mined_by_key}_evaluated-by_${evaluated_by_key}_${context_label}_raw.jsonl"
+  local output_path="${inference_dir}/m3cot_test_predictions_mined-by_${mined_by_key}_evaluated-by_${evaluated_by_key}_${context_label}_raw${replay_suffix}.jsonl"
 
   if [[ ! -f "${trace_path}" ]]; then
     echo "Mined trace file not found: ${trace_path}" >&2
@@ -90,7 +96,7 @@ eval_mined_trace_setting() {
     --config "${CONFIG}" \
     --dataset-partition test \
     --checkpoint-path "${evaluator_checkpoint_path}" \
-    --context "${context_label}" \
+    --context "${replay_context_label}" \
     --trace-variant raw \
     --seed "${SEED}" \
     --trace-path "${trace_path}" \

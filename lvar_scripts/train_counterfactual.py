@@ -70,6 +70,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Limit flattened counterfactual pairs.")
     parser.add_argument("--seed", type=int, default=None, help="Override phase4.seed.")
     parser.add_argument("--output-dir", default=None, help="Override phase4.output_dir.")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save intermediate epoch checkpoints every N epochs. Use 0 to disable epoch checkpoints.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -80,7 +86,11 @@ def main() -> None:
 
     if "controller_max_steps" in phase4_cfg:
         model_cfg["controller_max_steps"] = int(phase4_cfg["controller_max_steps"])
-    if bool(config.get("phase3", {}).get("phase3_v2", False)) or bool(config.get("phase3", {}).get("remove_global", False)):
+    phase3_cfg = config.get("phase3", {})
+    phase3_v2_cfg = config.get("phase3_v2", {})
+    phase3_v2_enabled = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
+    phase3_v2_removes_global = bool(phase3_v2_cfg.get("remove_global", phase3_cfg.get("remove_global", True)))
+    if phase3_v2_enabled and phase3_v2_removes_global:
         model_cfg["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in config.get("inference", {}):
         model_cfg["mask_immediate_repeats"] = bool(config["inference"]["mask_immediate_repeats"])
@@ -140,6 +150,13 @@ def main() -> None:
         )
     )
     num_epochs = int(phase4_cfg.get("num_epochs", 1))
+    checkpoint_every = int(
+        args.checkpoint_every
+        if args.checkpoint_every is not None
+        else phase4_cfg.get("checkpoint_every", 1)
+    )
+    if checkpoint_every < 0:
+        raise ValueError("phase4.checkpoint_every / --checkpoint-every must be >= 0.")
     grad_clip_norm = float(phase4_cfg.get("grad_clip_norm", 1.0))
     log_every = int(phase4_cfg.get("log_every", 10))
     image_size = phase4_cfg.get("image_size", config.get("phase2", {}).get("image_size", 280))
@@ -280,10 +297,13 @@ def main() -> None:
                 "noise_scale": noise_scale,
                 "summary": tracker.summary(),
                 "seed": seed,
+                "checkpoint_every": checkpoint_every,
             }
-            epoch_checkpoint_path = output_dir / f"counterfactual_epoch_{epoch + 1}.pt"
-            save_phase4_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
-            tqdm.write(f"Saved Phase 4 epoch checkpoint to {epoch_checkpoint_path}")
+            should_checkpoint_epoch = checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0
+            if should_checkpoint_epoch:
+                epoch_checkpoint_path = output_dir / f"counterfactual_epoch_{epoch + 1}.pt"
+                save_phase4_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
+                tqdm.write(f"Saved Phase 4 epoch checkpoint to {epoch_checkpoint_path}")
 
     if tracker.count == 0:
         raise ValueError(
@@ -317,6 +337,7 @@ def main() -> None:
         "noise_scale": noise_scale,
         "summary": tracker.summary(),
         "seed": seed,
+        "checkpoint_every": checkpoint_every,
     }
 
     checkpoint_path = output_dir / "counterfactual.pt"

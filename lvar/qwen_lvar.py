@@ -1,4 +1,5 @@
 import math
+import os
 from statistics import mean, median
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +44,7 @@ class ControllerHead(nn.Module):
         controller_num_states: int = 1,
         num_regions: int = 25,
         num_patches: int = 100,
+        index_temperature: Optional[float] = None,
     ) -> None:
         """
         Args:
@@ -53,6 +55,8 @@ class ControllerHead(nn.Module):
                 controller in tokenless mode.
             num_regions: Fixed number of region classes.
             num_patches: Fixed number of patch classes.
+            index_temperature: Optional clamp temperature for region/patch
+                logits. When set, index logits are bounded to +/- 1 / T.
 
         Attributes:
             fuse: MLP combining controller state embeddings.
@@ -64,6 +68,12 @@ class ControllerHead(nn.Module):
         self.use_control_tokens = use_control_tokens
         self.num_regions = int(num_regions)
         self.num_patches = int(num_patches)
+        self.index_logit_limit = None
+        if index_temperature is not None:
+            index_temperature = float(index_temperature)
+            if index_temperature <= 0.0:
+                raise ValueError("index_temperature must be greater than 0.")
+            self.index_logit_limit = 1.0 / index_temperature
         if self.num_regions <= 0:
             raise ValueError("num_regions must be greater than 0.")
         if self.num_patches <= 0:
@@ -96,7 +106,12 @@ class ControllerHead(nn.Module):
             controller_inputs = [state_hidden, step_hidden]
         controller_hidden = self.fuse(torch.cat(controller_inputs, dim=-1))
         type_logits = self.type_head(controller_hidden)
-        return type_logits, self.region_head(controller_hidden), self.patch_head(controller_hidden)
+        region_logits = self.region_head(controller_hidden)
+        patch_logits = self.patch_head(controller_hidden)
+        if self.index_logit_limit is not None:
+            region_logits = region_logits.clamp(-self.index_logit_limit, self.index_logit_limit)
+            patch_logits = patch_logits.clamp(-self.index_logit_limit, self.index_logit_limit)
+        return type_logits, region_logits, patch_logits
 
 
 class QwenLVAR(nn.Module):
@@ -139,11 +154,18 @@ class QwenLVAR(nn.Module):
         self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
         self.action_selection = cfg.get("action_selection", "argmax")
         self.controller_temperature = float(cfg.get("controller_temperature", 1.0))
+        self.controller_index_temperature = cfg.get("controller_index_temperature")
+        if self.controller_index_temperature is not None:
+            self.controller_index_temperature = float(self.controller_index_temperature)
         self.controller_num_regions = int(cfg.get("controller_num_regions", 25))
         self.controller_num_patches = int(cfg.get("controller_num_patches", 100))
         self.action_names = normalize_action_names(cfg.get("controller_action_names"))
         self.action_name_to_id = {name: idx for idx, name in self.action_names.items()}
         self.mask_immediate_repeats = bool(cfg.get("mask_immediate_repeats", False))
+        self.nucleus_insertion_enabled = bool(cfg.get("nucleus_insertion_enabled", False))
+        self.nucleus_insertion_scope = str(cfg.get("nucleus_insertion_scope", "both")).strip().lower()
+        self.nucleus_insertion_top_p = float(cfg.get("nucleus_insertion_top_p", 0.9))
+        self.nucleus_insertion_max_indices = int(cfg.get("nucleus_insertion_max_indices", 4))
         self.pooling = self._resolve_pooling(cfg.get("pooling", "mean"))
         self.use_control_tokens = bool(cfg.get("use_control_tokens", False))
         self.think_append_hidden = bool(cfg.get("think_append_hidden", True))
@@ -151,9 +173,20 @@ class QwenLVAR(nn.Module):
         self.controller_max_steps = int(cfg.get("controller_max_steps", self.max_steps))
         self.checkpoint_path = cfg.get("checkpoint_path") or cfg.get("ivtlr_checkpoint_path")
         self.use_checkpoint = bool(cfg.get("use_checkpoint", bool(self.checkpoint_path)))
+        mrope_position_env = os.environ.get("LVAR_USE_MROPE_POSITION_IDS")
+        self.use_mrope_position_ids = bool(cfg.get("use_mrope_position_ids", False))
+        if mrope_position_env is not None:
+            self.use_mrope_position_ids = mrope_position_env.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         if self.controller_temperature <= 0.0:
             raise ValueError("controller_temperature must be greater than 0.")
+        if self.controller_index_temperature is not None and self.controller_index_temperature <= 0.0:
+            raise ValueError("controller_index_temperature must be greater than 0.")
         if self.controller_num_regions <= 0:
             raise ValueError("controller_num_regions must be greater than 0.")
         if self.controller_num_patches <= 0:
@@ -162,6 +195,12 @@ class QwenLVAR(nn.Module):
             raise ValueError("controller_context_window must be greater than 0.")
         if self.controller_max_steps <= 0:
             raise ValueError("controller_max_steps must be greater than 0.")
+        if self.nucleus_insertion_scope not in {"patch", "region", "both"}:
+            raise ValueError("nucleus_insertion_scope must be 'patch', 'region', or 'both'.")
+        if self.nucleus_insertion_top_p <= 0.0 or self.nucleus_insertion_top_p > 1.0:
+            raise ValueError("nucleus_insertion_top_p must be in (0, 1].")
+        if self.nucleus_insertion_max_indices <= 0:
+            raise ValueError("nucleus_insertion_max_indices must be greater than 0.")
         if self.use_checkpoint and not self.checkpoint_path:
             raise ValueError("use_checkpoint is true but no checkpoint_path was provided.")
 
@@ -210,6 +249,7 @@ class QwenLVAR(nn.Module):
             controller_num_states=self.controller_num_states,
             num_regions=self.controller_num_regions,
             num_patches=self.controller_num_patches,
+            index_temperature=self.controller_index_temperature,
         )
         self.step_embedding = nn.Embedding(self.controller_max_steps, self.hidden_size)
 
@@ -567,6 +607,189 @@ class QwenLVAR(nn.Module):
             embeddings[image_mask] = image_tokens.to(embeddings.dtype)
         return embeddings, attention_mask.to(self.device)
 
+    def _unwrap_backbone_candidates(self) -> List[nn.Module]:
+        """Return likely HF/PEFT wrapper layers that may expose Qwen helper methods."""
+        candidates: List[nn.Module] = []
+        paths = [
+            (),
+            ("base_model",),
+            ("base_model", "model"),
+            ("base_model", "model", "model"),
+            ("model",),
+            ("model", "model"),
+            ("language_model",),
+        ]
+        seen: set[int] = set()
+        for path in paths:
+            current: Any = self.backbone
+            for attr in path:
+                current = getattr(current, attr, None)
+                if current is None:
+                    break
+            if isinstance(current, nn.Module) and id(current) not in seen:
+                seen.add(id(current))
+                candidates.append(current)
+        return candidates
+
+    def _compute_reference_position_ids(
+        self,
+        batch: Dict[str, Any],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute Qwen2-VL MRoPE position ids from the original multimodal batch."""
+        if not self.use_mrope_position_ids:
+            return None, None
+        input_ids = batch.get("input_ids")
+        if input_ids is None:
+            return None, None
+        attention_mask = batch.get("attention_mask")
+        image_grid_thw = batch.get("image_grid_thw")
+        video_grid_thw = batch.get("video_grid_thw")
+        if isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = image_grid_thw.detach().cpu().to(dtype=torch.long)
+        if isinstance(video_grid_thw, torch.Tensor):
+            video_grid_thw = video_grid_thw.detach().cpu().to(dtype=torch.long)
+        for candidate in self._unwrap_backbone_candidates():
+            get_rope_index = getattr(candidate, "get_rope_index", None)
+            if get_rope_index is None:
+                continue
+            try:
+                result = get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                )
+            except TypeError:
+                try:
+                    result = get_rope_index(input_ids, image_grid_thw, video_grid_thw, attention_mask)
+                except TypeError:
+                    continue
+            if isinstance(result, tuple):
+                position_ids = result[0]
+                rope_deltas = result[1] if len(result) > 1 else None
+            else:
+                position_ids = result
+                rope_deltas = None
+            return position_ids.to(self.device), rope_deltas.to(self.device) if isinstance(rope_deltas, torch.Tensor) else None
+        return None, None
+
+    def _select_visual_replacement_position_ids(
+        self,
+        original_visual_position_ids: torch.Tensor,
+        num_visual_tokens: int,
+    ) -> torch.Tensor:
+        """Choose MRoPE coordinates for a shortened/custom visual-token span."""
+        if num_visual_tokens <= 0:
+            return original_visual_position_ids[:, :, :0]
+        original_count = original_visual_position_ids.size(-1)
+        if original_count == num_visual_tokens:
+            return original_visual_position_ids
+        if original_count <= 0:
+            base = torch.zeros(
+                (original_visual_position_ids.size(0), original_visual_position_ids.size(1), 1),
+                device=self.device,
+                dtype=original_visual_position_ids.dtype,
+            )
+            offsets = torch.arange(num_visual_tokens, device=self.device, dtype=original_visual_position_ids.dtype)
+            return base + offsets.view(1, 1, -1)
+        if num_visual_tokens == 1:
+            return original_visual_position_ids[:, :, :1]
+        indices = torch.linspace(
+            0,
+            original_count - 1,
+            steps=num_visual_tokens,
+            device=original_visual_position_ids.device,
+        ).round().long()
+        return original_visual_position_ids.index_select(-1, indices)
+
+    def _position_ids_for_visual_replacement(
+        self,
+        batch: Dict[str, Any],
+        num_visual_tokens: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Build position ids when the image placeholder span is replaced by custom visual tokens."""
+        reference_position_ids, rope_deltas = self._compute_reference_position_ids(batch)
+        if reference_position_ids is None:
+            return None, rope_deltas
+        input_ids = batch.get("input_ids")
+        if input_ids is None or self.image_token_id is None:
+            return reference_position_ids, rope_deltas
+        image_positions = torch.nonzero(input_ids[0] == self.image_token_id, as_tuple=False).flatten()
+        if image_positions.numel() == 0:
+            return reference_position_ids, rope_deltas
+        start = int(image_positions[0].item())
+        end = int(image_positions[-1].item()) + 1
+        visual_positions = self._select_visual_replacement_position_ids(
+            reference_position_ids[:, :, start:end],
+            int(num_visual_tokens),
+        )
+        return (
+            torch.cat(
+                [
+                    reference_position_ids[:, :, :start],
+                    visual_positions,
+                    reference_position_ids[:, :, end:],
+                ],
+                dim=-1,
+            ),
+            rope_deltas,
+        )
+
+    def _append_position_ids(self, state: Dict[str, Any], num_tokens: int = 1) -> None:
+        """Append text-style MRoPE positions for generated/THINK tokens."""
+        position_ids = state.get("position_ids")
+        if position_ids is None or num_tokens <= 0:
+            return
+        last_position = position_ids[:, :, -1:]
+        offsets = torch.arange(
+            1,
+            num_tokens + 1,
+            device=position_ids.device,
+            dtype=position_ids.dtype,
+        ).view(1, 1, -1)
+        appended = last_position + offsets
+        state["position_ids"] = torch.cat([position_ids, appended], dim=-1)
+
+    def _insert_position_ids(self, state: Dict[str, Any], insert_pos: int, num_tokens: int) -> None:
+        """Insert text-style positions and shift later positions to preserve order."""
+        position_ids = state.get("position_ids")
+        if position_ids is None or num_tokens <= 0:
+            return
+        insert_pos = int(insert_pos)
+        if insert_pos >= position_ids.size(-1):
+            self._append_position_ids(state, num_tokens)
+            return
+        base = position_ids[:, :, insert_pos : insert_pos + 1]
+        offsets = torch.arange(
+            0,
+            num_tokens,
+            device=position_ids.device,
+            dtype=position_ids.dtype,
+        ).view(1, 1, -1)
+        inserted = base + offsets
+        shifted_suffix = position_ids[:, :, insert_pos:] + int(num_tokens)
+        state["position_ids"] = torch.cat(
+            [position_ids[:, :, :insert_pos], inserted, shifted_suffix],
+            dim=-1,
+        )
+
+    def _drop_position_id(self, state: Dict[str, Any], drop_pos: int) -> None:
+        """Drop the position id matching a removed token."""
+        position_ids = state.get("position_ids")
+        if position_ids is None:
+            return
+        state["position_ids"] = torch.cat(
+            [position_ids[:, :, :drop_pos], position_ids[:, :, drop_pos + 1 :]],
+            dim=-1,
+        )
+
+    def _state_position_kwargs(self, state: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Return optional position kwargs for backbone calls from a mutable state."""
+        position_ids = state.get("position_ids")
+        if self.use_mrope_position_ids and isinstance(position_ids, torch.Tensor):
+            return {"position_ids": position_ids}
+        return {}
+
     def _build_pooled_multimodal_embeddings(
         self,
         batch: Dict[str, Any],
@@ -747,6 +970,29 @@ class QwenLVAR(nn.Module):
             index_tensor = torch.argmax(index_logits, dim=-1)
         return index_tensor, distribution.log_prob(index_tensor)
 
+    def _nucleus_insertion_applies(self, action_name: str) -> bool:
+        """Return whether inference-time top-p multi-index insertion applies to this action."""
+        if not self.nucleus_insertion_enabled or self.training:
+            return False
+        action = str(action_name).strip().lower()
+        return self.nucleus_insertion_scope == "both" or self.nucleus_insertion_scope == action
+
+    def _select_nucleus_indices(self, index_logits: torch.Tensor) -> Tuple[List[int], torch.Tensor]:
+        """Select the smallest descending-probability top-p set, capped by configuration."""
+        log_probs = torch.log_softmax(index_logits, dim=-1).squeeze(0)
+        probabilities = log_probs.exp()
+        sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        # Keep every item whose probability interval starts below top-p. This
+        # includes the item that crosses the threshold and always keeps at least one.
+        keep = (cumulative - sorted_probs) < self.nucleus_insertion_top_p
+        selected = sorted_indices[keep][: self.nucleus_insertion_max_indices]
+        if selected.numel() == 0:
+            selected = sorted_indices[:1]
+        selected_indices = [int(index) for index in selected.detach().cpu().tolist()]
+        selected_log_prob = log_probs[selected].sum().unsqueeze(0)
+        return selected_indices, selected_log_prob
+
     def _distribution_to_list(self, logits: torch.Tensor) -> list:
         """Convert controller logits into a plain Python probability list."""
         probabilities = torch.softmax(logits, dim=-1)
@@ -764,14 +1010,16 @@ class QwenLVAR(nn.Module):
         action_entropy = self._entropy_from_logits(type_logits)
         region_entropy = self._entropy_from_logits(region_logits)
         patch_entropy = self._entropy_from_logits(patch_logits)
+        region_action_id = self.action_name_to_id.get("REGION")
+        patch_action_id = self.action_name_to_id.get("PATCH")
         region_probability = (
-            float(action_probs[self.action_names.index("REGION")].detach().cpu().item())
-            if "REGION" in self.action_names
+            float(action_probs[int(region_action_id)].detach().cpu().item())
+            if region_action_id is not None
             else 0.0
         )
         patch_probability = (
-            float(action_probs[self.action_names.index("PATCH")].detach().cpu().item())
-            if "PATCH" in self.action_names
+            float(action_probs[int(patch_action_id)].detach().cpu().item())
+            if patch_action_id is not None
             else 0.0
         )
         controller_entropy = (
@@ -857,6 +1105,7 @@ class QwenLVAR(nn.Module):
         state["attention_mask"] = torch.cat([state["attention_mask"], new_mask], dim=1)
         if track_as_think:
             state.setdefault("trace_all_positions", []).append(append_pos)
+        self._append_position_ids(state, num_tokens=1)
 
     def _shift_trace_positions_for_insert(
         self,
@@ -907,6 +1156,7 @@ class QwenLVAR(nn.Module):
             dtype=state["attention_mask"].dtype,
         )
         state["attention_mask"] = torch.cat([prefix_mask, new_mask, suffix_mask], dim=1)
+        self._insert_position_ids(state, insert_pos, num_tokens)
 
         if self.use_control_tokens:
             state["latent_pos"] += num_tokens
@@ -1062,6 +1312,7 @@ class QwenLVAR(nn.Module):
         step can update it in-place.
         """
         inputs_embeds, attention_mask = self._build_multimodal_embeddings(batch)
+        position_ids, rope_deltas = self._compute_reference_position_ids(batch)
         latent_pos = None
         act_pos = None
         if self.use_control_tokens:
@@ -1075,11 +1326,17 @@ class QwenLVAR(nn.Module):
                 ],
                 dim=1,
             )
+            if position_ids is not None:
+                position_state = {"position_ids": position_ids}
+                self._append_position_ids(position_state, num_tokens=2)
+                position_ids = position_state["position_ids"]
             latent_pos = inputs_embeds.size(1) - 2
             act_pos = inputs_embeds.size(1) - 1
         return {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "rope_deltas": rope_deltas,
             "latent_pos": latent_pos,
             "act_pos": act_pos,
             "trace_all_positions": [],
@@ -1102,6 +1359,10 @@ class QwenLVAR(nn.Module):
         use build_initial_state, which keeps the full image-token prompt.
         """
         inputs_embeds, attention_mask = self._build_visual_token_multimodal_embeddings(batch, bank["global"])
+        position_ids, rope_deltas = self._position_ids_for_visual_replacement(
+            batch,
+            num_visual_tokens=bank["global"].size(0),
+        )
         latent_pos = None
         act_pos = None
         if self.use_control_tokens:
@@ -1115,11 +1376,17 @@ class QwenLVAR(nn.Module):
                 ],
                 dim=1,
             )
+            if position_ids is not None:
+                position_state = {"position_ids": position_ids}
+                self._append_position_ids(position_state, num_tokens=2)
+                position_ids = position_state["position_ids"]
             latent_pos = inputs_embeds.size(1) - 2
             act_pos = inputs_embeds.size(1) - 1
         return {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "rope_deltas": rope_deltas,
             "latent_pos": latent_pos,
             "act_pos": act_pos,
             "trace_all_positions": [],
@@ -1161,6 +1428,7 @@ class QwenLVAR(nn.Module):
             outputs = self.backbone(
                 inputs_embeds=state["inputs_embeds"],
                 attention_mask=state["attention_mask"],
+                **self._state_position_kwargs(state),
                 output_hidden_states=True,
                 return_dict=True,
                 use_cache=False,
@@ -1217,6 +1485,7 @@ class QwenLVAR(nn.Module):
             outputs = self.backbone(
                 inputs_embeds=state["inputs_embeds"],
                 attention_mask=state["attention_mask"],
+                **self._state_position_kwargs(state),
                 output_hidden_states=True,
                 return_dict=True,
                 use_cache=False,
@@ -1224,27 +1493,40 @@ class QwenLVAR(nn.Module):
         final_hidden = self._extract_final_hidden(outputs)
         state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         step_hidden = self._controller_step_hidden(step_idx)
-        logits = self.controller(state_hidden, step_hidden, bank, act_hidden=act_hidden)
-        self._validate_fixed_index_logits(logits[1], logits[2], bank)
-        return logits
+        type_logits, region_logits, patch_logits = self.controller(
+            state_hidden,
+            step_hidden,
+            bank,
+            act_hidden=act_hidden,
+        )
+        region_logits, patch_logits = self._align_fixed_index_logits(region_logits, patch_logits, bank)
+        return type_logits, region_logits, patch_logits
 
-    def _validate_fixed_index_logits(
+    def _align_fixed_index_logits(
         self,
         region_logits: torch.Tensor,
         patch_logits: torch.Tensor,
         bank: Dict[str, torch.Tensor],
-    ) -> None:
-        """Ensure fixed classifier heads match the current visual bank size."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Align fixed classifier outputs to the current visual bank size."""
         num_regions = bank["regions"].size(0)
         num_patches = bank["patches"].size(0)
-        if region_logits.size(-1) != num_regions:
-            raise ValueError(
-                f"Controller region head has {region_logits.size(-1)} classes, but visual bank has {num_regions} regions."
-            )
-        if patch_logits.size(-1) != num_patches:
-            raise ValueError(
-                f"Controller patch head has {patch_logits.size(-1)} classes, but visual bank has {num_patches} patches."
-            )
+        return (
+            self._align_index_logits(region_logits, num_regions),
+            self._align_index_logits(patch_logits, num_patches),
+        )
+
+    @staticmethod
+    def _align_index_logits(logits: torch.Tensor, target_size: int) -> torch.Tensor:
+        current_size = logits.size(-1)
+        if current_size == target_size:
+            return logits
+        if current_size > target_size:
+            return logits[..., :target_size]
+        pad_shape = (*logits.shape[:-1], target_size - current_size)
+        pad_value = torch.finfo(logits.dtype).min
+        padding = torch.full(pad_shape, pad_value, device=logits.device, dtype=logits.dtype)
+        return torch.cat([logits, padding], dim=-1)
 
     def apply_mined_actions(
         self,
@@ -1301,6 +1583,7 @@ class QwenLVAR(nn.Module):
             outputs = self.backbone(
                 inputs_embeds=state["inputs_embeds"],
                 attention_mask=state["attention_mask"],
+                **self._state_position_kwargs(state),
                 output_hidden_states=True,
                 return_dict=True,
                 use_cache=False,
@@ -1322,22 +1605,30 @@ class QwenLVAR(nn.Module):
             bank,
             act_hidden=act_hidden,
         )
-        self._validate_fixed_index_logits(region_logits, patch_logits, bank)
+        region_logits, patch_logits = self._align_fixed_index_logits(region_logits, patch_logits, bank)
         scaled_type_logits = self._scale_controller_logits(type_logits)
         scaled_region_logits = self._scale_controller_logits(region_logits)
         scaled_patch_logits = self._scale_controller_logits(patch_logits)
         if self.mask_immediate_repeats and state.get("last_action") == "REGION":
-            last_region = state.get("last_region_index")
-            if isinstance(last_region, int) and scaled_region_logits.size(-1) > 1:
+            last_regions = state.get("last_region_indices")
+            if not isinstance(last_regions, list):
+                last_region = state.get("last_region_index")
+                last_regions = [last_region] if isinstance(last_region, int) else []
+            if last_regions and scaled_region_logits.size(-1) > len(last_regions):
                 scaled_region_logits = scaled_region_logits.clone()
-                if 0 <= last_region < scaled_region_logits.size(-1):
-                    scaled_region_logits[:, last_region] = torch.finfo(scaled_region_logits.dtype).min
+                for last_region in last_regions:
+                    if 0 <= int(last_region) < scaled_region_logits.size(-1):
+                        scaled_region_logits[:, int(last_region)] = torch.finfo(scaled_region_logits.dtype).min
         if self.mask_immediate_repeats and state.get("last_action") == "PATCH":
-            last_patch = state.get("last_patch_index")
-            if isinstance(last_patch, int) and scaled_patch_logits.size(-1) > 1:
+            last_patches = state.get("last_patch_indices")
+            if not isinstance(last_patches, list):
+                last_patch = state.get("last_patch_index")
+                last_patches = [last_patch] if isinstance(last_patch, int) else []
+            if last_patches and scaled_patch_logits.size(-1) > len(last_patches):
                 scaled_patch_logits = scaled_patch_logits.clone()
-                if 0 <= last_patch < scaled_patch_logits.size(-1):
-                    scaled_patch_logits[:, last_patch] = torch.finfo(scaled_patch_logits.dtype).min
+                for last_patch in last_patches:
+                    if 0 <= int(last_patch) < scaled_patch_logits.size(-1):
+                        scaled_patch_logits[:, int(last_patch)] = torch.finfo(scaled_patch_logits.dtype).min
         action_probs = self._distribution_to_list(scaled_type_logits)
         region_probs = self._distribution_to_list(scaled_region_logits)
         patch_probs = self._distribution_to_list(scaled_patch_logits)
@@ -1357,25 +1648,35 @@ class QwenLVAR(nn.Module):
         # Map action to evidence token selection. THINK and STOP add no evidence.
         region_index = None
         patch_index = None
-        evidence_token = None
+        region_indices: List[int] = []
+        patch_indices: List[int] = []
+        evidence_tokens: List[torch.Tensor] = []
         if action_name == "GLOBAL":
-            evidence_token = bank["global"][0].unsqueeze(0)
+            evidence_tokens = [bank["global"][0].unsqueeze(0)]
         elif action_name == "REGION":
-            region_tensor, region_log_prob = self._select_index(
-                scaled_region_logits,
-                state.get("sample_actions", False),
-            )
-            region_index = int(region_tensor.item())
+            if self._nucleus_insertion_applies("region"):
+                region_indices, region_log_prob = self._select_nucleus_indices(scaled_region_logits)
+            else:
+                region_tensor, region_log_prob = self._select_index(
+                    scaled_region_logits,
+                    state.get("sample_actions", False),
+                )
+                region_indices = [int(region_tensor.item())]
+            region_index = region_indices[0]
             action_log_prob = action_log_prob + region_log_prob
-            evidence_token = bank["raw_regions"][region_index]
+            evidence_tokens = [bank["raw_regions"][index] for index in region_indices]
         elif action_name == "PATCH":
-            patch_tensor, patch_log_prob = self._select_index(
-                scaled_patch_logits,
-                state.get("sample_actions", False),
-            )
-            patch_index = int(patch_tensor.item())
+            if self._nucleus_insertion_applies("patch"):
+                patch_indices, patch_log_prob = self._select_nucleus_indices(scaled_patch_logits)
+            else:
+                patch_tensor, patch_log_prob = self._select_index(
+                    scaled_patch_logits,
+                    state.get("sample_actions", False),
+                )
+                patch_indices = [int(patch_tensor.item())]
+            patch_index = patch_indices[0]
             action_log_prob = action_log_prob + patch_log_prob
-            evidence_token = bank["patches"][patch_index].unsqueeze(0)
+            evidence_tokens = [bank["patches"][index].unsqueeze(0) for index in patch_indices]
 
         sequence_length_before = state["inputs_embeds"].size(1)
         # THINK is the only action that performs a pure recurrent hidden-state update.
@@ -1396,7 +1697,7 @@ class QwenLVAR(nn.Module):
                 state["inputs_embeds"] = updated_embeds
 
         # Then insert chosen evidence before the latent token or current final token.
-        if evidence_token is not None:
+        for evidence_token in evidence_tokens:
             self._insert_evidence_token(state, evidence_token)
 
         # Persist step-level metadata for debug and policy-gradient training.
@@ -1413,6 +1714,14 @@ class QwenLVAR(nn.Module):
             "controller_temperature": self.controller_temperature,
             "region_index": region_index,
             "patch_index": patch_index,
+            "region_indices": region_indices,
+            "patch_indices": patch_indices,
+            "nucleus_insertion_applied": bool(
+                (action_name == "REGION" and self._nucleus_insertion_applies("region"))
+                or (action_name == "PATCH" and self._nucleus_insertion_applies("patch"))
+            ),
+            "nucleus_insertion_top_p": self.nucleus_insertion_top_p,
+            "nucleus_insertion_scope": self.nucleus_insertion_scope,
             "sequence_length_before": sequence_length_before,
             "sequence_length_after": state["inputs_embeds"].size(1),
             "action_log_prob": float(action_log_prob.detach().item()),
@@ -1422,6 +1731,8 @@ class QwenLVAR(nn.Module):
         state["last_action"] = action_name
         state["last_region_index"] = region_index
         state["last_patch_index"] = patch_index
+        state["last_region_indices"] = region_indices
+        state["last_patch_indices"] = patch_indices
         return state, action_id, should_stop, step_trace
 
     def drop_act_token(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1443,6 +1754,7 @@ class QwenLVAR(nn.Module):
             [state["attention_mask"][:, :act_pos], state["attention_mask"][:, act_pos + 1 :]],
             dim=1,
         )
+        self._drop_position_id(state, int(act_pos))
         self._shift_trace_positions_for_drop(state, int(act_pos))
         state["act_pos"] = None
         return state
@@ -1459,6 +1771,11 @@ class QwenLVAR(nn.Module):
         decode_prefix_length = state["inputs_embeds"].size(1)
         current_embeds = state["inputs_embeds"]
         current_mask = state["attention_mask"]
+        current_position_ids = (
+            state.get("position_ids")
+            if self.use_mrope_position_ids and isinstance(state.get("position_ids"), torch.Tensor)
+            else None
+        )
         generated_ids = []
         token_entropies = []
         option_token_ids = self._answer_option_token_ids()
@@ -1474,6 +1791,7 @@ class QwenLVAR(nn.Module):
                 outputs = self.backbone(
                     inputs_embeds=current_embeds,
                     attention_mask=current_mask,
+                    **({"position_ids": current_position_ids} if current_position_ids is not None else {}),
                     output_hidden_states=False,
                     return_dict=True,
                     use_cache=False,
@@ -1502,6 +1820,9 @@ class QwenLVAR(nn.Module):
                     ],
                     dim=1,
                 )
+                if current_position_ids is not None:
+                    next_position = current_position_ids[:, :, -1:] + 1
+                    current_position_ids = torch.cat([current_position_ids, next_position], dim=-1)
 
         generated_tensor = torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         generated_text = self._decode_ids(generated_tensor.cpu()) if generated_ids else ""
@@ -1521,6 +1842,7 @@ class QwenLVAR(nn.Module):
             "final_sequence_length": current_embeds.size(1),
             "final_inputs_embeds": current_embeds,
             "final_attention_mask": current_mask,
+            "final_position_ids": current_position_ids,
         }
 
     def _build_decode_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1533,6 +1855,16 @@ class QwenLVAR(nn.Module):
         return {
             "inputs_embeds": state["inputs_embeds"].detach(),
             "attention_mask": state["attention_mask"].detach(),
+            "position_ids": (
+                state["position_ids"].detach()
+                if isinstance(state.get("position_ids"), torch.Tensor)
+                else None
+            ),
+            "rope_deltas": (
+                state["rope_deltas"].detach()
+                if isinstance(state.get("rope_deltas"), torch.Tensor)
+                else None
+            ),
             "latent_pos": state.get("latent_pos"),
             "act_pos": state.get("act_pos"),
             "trace_all_positions": list(state.get("trace_all_positions", [])),
@@ -1623,9 +1955,12 @@ class QwenLVAR(nn.Module):
         image_tokens = self.get_projected_image_tokens(prepared)
         prepared["projected_image_tokens"] = image_tokens
         inputs_embeds, attention_mask = self._build_multimodal_embeddings(prepared)
+        position_ids, rope_deltas = self._compute_reference_position_ids(prepared)
         state = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "rope_deltas": rope_deltas,
             "latent_pos": None,
             "act_pos": None,
             "trace_all_positions": [],
@@ -1662,9 +1997,12 @@ class QwenLVAR(nn.Module):
         image_tokens = self.get_projected_image_tokens(prepared)
         prepared["projected_image_tokens"] = image_tokens
         inputs_embeds, attention_mask = self._build_pooled_multimodal_embeddings(prepared, pooling)
+        position_ids, rope_deltas = self._position_ids_for_visual_replacement(prepared, num_visual_tokens=1)
         state = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "rope_deltas": rope_deltas,
             "latent_pos": None,
             "act_pos": None,
         }
@@ -1692,9 +2030,15 @@ class QwenLVAR(nn.Module):
         prepared["projected_image_tokens"] = image_tokens
         region_tokens, _ = self.build_region_tokens(image_tokens, pooling=pooling)
         inputs_embeds, attention_mask = self._build_visual_token_multimodal_embeddings(prepared, region_tokens)
+        position_ids, rope_deltas = self._position_ids_for_visual_replacement(
+            prepared,
+            num_visual_tokens=region_tokens.size(0),
+        )
         state = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "rope_deltas": rope_deltas,
             "latent_pos": None,
             "act_pos": None,
         }
@@ -1715,11 +2059,13 @@ class QwenLVAR(nn.Module):
         was_training = self.training
         self.eval()
         with torch.no_grad():
+            forward_kwargs = {"sample_actions": self._inference_uses_sampling()}
+            if image_size is not None:
+                forward_kwargs["image_size"] = image_size
             output = self.forward(
                 images,
                 questions,
-                sample_actions=self._inference_uses_sampling(),
-                image_size=image_size,
+                **forward_kwargs,
             )
         self.train(was_training)
         return {

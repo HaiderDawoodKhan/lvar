@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from lvar.dataset import CLEVRCoGenTDataset, M3CoTDataset, ScienceQADataset, build_dataset
-from lvar.rewards import normalize_answer
+from lvar.rewards import normalize_answer, verify_choice_output
 
 
 class FakeHFDataset:
@@ -125,23 +125,32 @@ class DatasetTests(unittest.TestCase):
 
         self.assertEqual(len(dataset), 1)
         self.assertEqual(example["image"], "fake-image")
-        self.assertIn("Hint: Use the compass rose.", example["question"])
-        self.assertIn("A. West Virginia", example["question"])
-        self.assertIn("D. Oklahoma", example["question"])
+        self.assertIn("[Question]:{Which state is farthest north?}", example["question"])
+        self.assertIn("(A).{West Virginia}", example["question"])
+        self.assertIn("(D).{Oklahoma}", example["question"])
+        self.assertTrue(example["question"].endswith("Answer:\n"))
+        self.assertEqual(example["steps"], ["West Virginia is farthest north."])
+        self.assertEqual(example["answer"], "A")
         self.assertEqual(example["solution"], "West Virginia is farthest north.\n<answer>A</answer>")
         self.assertEqual(example["gold_answer"], "a")
         self.assertEqual(example["answer_index"], 0)
+        self.assertEqual(example["raw_answer"], "0")
 
     @patch("lvar.dataset.load_dataset")
     def test_build_dataset_uses_scienceqa_partition_as_split(self, mock_load_dataset):
         mock_load_dataset.return_value = FakeHFDataset([])
 
         build_dataset(
-            {"type": "scienceqa", "name": "derek-thomas/ScienceQA", "split": "train"},
+            {"type": "sqa", "name": "derek-thomas/ScienceQA", "split": "train"},
             partition="validation",
         )
 
         mock_load_dataset.assert_called_once_with("derek-thomas/ScienceQA", split="validation")
+
+    def test_choice_verifier_accepts_numeric_gold_with_letter_output(self):
+        self.assertTrue(verify_choice_output("<answer>A</answer>", "0"))
+        self.assertTrue(verify_choice_output("A", "0"))
+        self.assertTrue(verify_choice_output("The answer is 0", "A"))
 
     @patch("lvar.dataset.load_dataset")
     def test_train_test_partitions_are_deterministic_and_disjoint(self, mock_load_dataset):

@@ -106,9 +106,13 @@ def format_trace_step(step_trace: Dict[str, object]) -> str:
         f"region_prob={region_probs}",
         f"patch_prob={patch_probs}",
     ]
-    if step_trace.get("region_index") is not None:
+    if step_trace.get("region_indices"):
+        parts.append(f"regions={step_trace['region_indices']}")
+    elif step_trace.get("region_index") is not None:
         parts.append(f"region={step_trace['region_index']}")
-    if step_trace.get("patch_index") is not None:
+    if step_trace.get("patch_indices"):
+        parts.append(f"patches={step_trace['patch_indices']}")
+    elif step_trace.get("patch_index") is not None:
         parts.append(f"patch={step_trace['patch_index']}")
     return " | ".join(parts)
 
@@ -138,6 +142,16 @@ def add_model_loading_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override model.merge_lora from the config.",
+    )
+    parser.add_argument(
+        "--use-mrope-position-ids",
+        dest="use_mrope_position_ids",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pass Qwen2-VL MRoPE position_ids through custom LVAR inputs_embeds paths. "
+            "Disable to preserve the legacy sequential-position behavior."
+        ),
     )
 
 
@@ -172,6 +186,8 @@ def apply_model_loading_overrides(model_cfg: Dict[str, object], args: argparse.N
         updated_cfg["checkpoint_path"] = args.checkpoint_path
     if args.merge_lora is not None:
         updated_cfg["merge_lora"] = args.merge_lora
+    if getattr(args, "use_mrope_position_ids", None) is not None:
+        updated_cfg["use_mrope_position_ids"] = args.use_mrope_position_ids
     return updated_cfg
 
 

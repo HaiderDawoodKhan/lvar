@@ -35,6 +35,20 @@ def load_config(config_path: str):
         return yaml.safe_load(handle)
 
 
+def parse_config_overrides(values):
+    """Parse repeated key=value CLI overrides using YAML scalar syntax."""
+    overrides = {}
+    for raw_value in values or []:
+        if "=" not in raw_value:
+            raise ValueError(f"Config override must be key=value, got: {raw_value}")
+        key, value = raw_value.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Config override key cannot be empty: {raw_value}")
+        overrides[key] = yaml.safe_load(value)
+    return overrides
+
+
 def update_weighted_means(totals, counts, means, mean_counts) -> None:
     """Accumulate weighted scalar means from per-example metric dictionaries."""
     for key, value in means.items():
@@ -58,20 +72,47 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Limit mined trace rows used for SFT.")
     parser.add_argument("--seed", type=int, default=None, help="Override phase3.seed.")
     parser.add_argument("--output-dir", default=None, help="Override phase3.output_dir.")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save intermediate epoch checkpoints every N epochs. Use 0 to disable epoch checkpoints.",
+    )
+    parser.add_argument(
+        "--phase3-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a phase3 config value. Can be repeated; values are parsed as YAML scalars.",
+    )
+    parser.add_argument(
+        "--phase3-v2-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a phase3_v2 config value. Can be repeated; values are parsed as YAML scalars.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
-    phase3_cfg = config.get("phase3", {})
+    phase3_cfg = dict(config.get("phase3", {}))
+    phase3_cfg.update(parse_config_overrides(args.phase3_override))
+    phase3_v2_cfg = dict(config.get("phase3_v2", {}))
+    phase3_v2_cfg.update(parse_config_overrides(args.phase3_v2_override))
     dataset_cfg = config["dataset"]
     model_cfg = apply_model_loading_overrides(config["model"], args)
 
     if "controller_max_steps" in phase3_cfg:
         model_cfg["controller_max_steps"] = int(phase3_cfg["controller_max_steps"])
-    phase3_v2 = bool(phase3_cfg.get("phase3_v2", phase3_cfg.get("remove_global", False)))
-    if phase3_v2:
+    phase3_v2 = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
+    v2_value = lambda key, default: phase3_v2_cfg.get(key, phase3_cfg.get(key, default))
+    remove_global = bool(v2_value("remove_global", True))
+    mask_immediate_repeats = bool(v2_value("mask_immediate_repeats", True))
+    if phase3_v2 and remove_global:
         model_cfg["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
-        model_cfg["mask_immediate_repeats"] = bool(phase3_cfg.get("mask_immediate_repeats", True))
+    if phase3_v2:
+        model_cfg["mask_immediate_repeats"] = mask_immediate_repeats
 
     seed = int(args.seed if args.seed is not None else phase3_cfg.get("seed", config.get("train", {}).get("seed", 42)))
     set_seed(seed)
@@ -113,24 +154,32 @@ def main() -> None:
     )
 
     num_epochs = int(phase3_cfg.get("num_epochs", 1))
+    checkpoint_every = int(
+        args.checkpoint_every
+        if args.checkpoint_every is not None
+        else phase3_cfg.get("checkpoint_every", 1)
+    )
+    if checkpoint_every < 0:
+        raise ValueError("phase3.checkpoint_every / --checkpoint-every must be >= 0.")
     grad_clip_norm = float(phase3_cfg.get("grad_clip_norm", 1.0))
     log_every = int(phase3_cfg.get("log_every", 10))
     image_size = phase3_cfg.get("image_size", config.get("phase2", {}).get("image_size", 280))
     full_context_probability = float(phase3_cfg.get("full_context_probability", 0.1))
     if full_context_probability < 0.0 or full_context_probability > 1.0:
         raise ValueError("phase3.full_context_probability must be in [0, 1].")
+    use_one_replay_setting = bool(phase3_cfg.get("use_one_replay_setting", False))
+    replay_setting = str(phase3_cfg.get("replay_setting", "global_mean"))
     decision_block_normalized = bool(phase3_cfg.get("decision_block_normalized", phase3_v2))
     use_type_loss_weights = bool(phase3_cfg.get("use_type_loss_weights", phase3_v2))
     type_loss_weights = {}
     if use_type_loss_weights:
         type_loss_weights = dict(PHASE3_V2_TYPE_LOSS_WEIGHTS if phase3_v2 else {})
         type_loss_weights.update(phase3_cfg.get("type_loss_weights", {}) or {})
-    visual_or_region_min_improvement = float(phase3_cfg.get("visual_or_region_min_improvement", 0.05))
-    think_min_improvement = float(phase3_cfg.get("think_min_improvement", 0.03))
-    max_decision_blocks = int(phase3_cfg.get("max_decision_blocks_per_example", 6))
-    max_primitive_actions = int(phase3_cfg.get("max_primitive_actions_per_example", 8))
-    no_op_stop_ce_threshold = float(phase3_cfg.get("no_op_stop_ce_threshold", 0.05))
-    remove_global = bool(phase3_cfg.get("remove_global", phase3_v2))
+    visual_or_region_min_improvement = float(v2_value("visual_or_region_min_improvement", 0.05))
+    think_min_improvement = float(v2_value("think_min_improvement", 0.03))
+    max_decision_blocks = int(v2_value("max_decision_blocks_per_example", 6))
+    max_primitive_actions = int(v2_value("max_primitive_actions_per_example", 8))
+    no_op_stop_ce_threshold = float(v2_value("no_op_stop_ce_threshold", 0.05))
     visual_block_dropout_p = float(phase3_cfg.get("visual_block_dropout_p", 0.0))
     multi_hot_patch_labels = bool(phase3_cfg.get("multi_hot_patch_labels", False))
     multi_hot_patch_target_mode = str(phase3_cfg.get("multi_hot_patch_target_mode", "binary"))
@@ -177,6 +226,8 @@ def main() -> None:
                 source_example,
                 image_size=image_size,
                 full_context_probability=full_context_probability,
+                use_one_replay_setting=use_one_replay_setting,
+                replay_setting=replay_setting,
                 rng=context_rng,
                 decision_block_normalized=decision_block_normalized,
                 type_loss_weights=type_loss_weights,
@@ -284,9 +335,12 @@ def main() -> None:
                 "action_counts": dict(action_totals),
                 "initial_visual_counts": dict(initial_visual_totals),
                 "full_context_probability": full_context_probability,
+                "use_one_replay_setting": use_one_replay_setting,
+                "replay_setting": replay_setting,
                 "loaded_phase4_vlm": loaded_phase4_vlm,
                 "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
                 "phase3_v2": phase3_v2,
+                "phase3_v2_config": dict(phase3_v2_cfg),
                 "decision_block_normalized": decision_block_normalized,
                 "use_type_loss_weights": use_type_loss_weights,
                 "type_loss_weights": type_loss_weights,
@@ -302,10 +356,13 @@ def main() -> None:
                 "controller_context_window": model.controller_num_states,
                 "controller_max_steps": model.step_embedding.num_embeddings,
                 "seed": seed,
+                "checkpoint_every": checkpoint_every,
             }
-            epoch_checkpoint_path = output_dir / f"controller_sft_epoch_{epoch + 1}.pt"
-            save_controller_sft_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
-            tqdm.write(f"Saved Phase 3 epoch checkpoint to {epoch_checkpoint_path}")
+            should_checkpoint_epoch = checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0
+            if should_checkpoint_epoch:
+                epoch_checkpoint_path = output_dir / f"controller_sft_epoch_{epoch + 1}.pt"
+                save_controller_sft_checkpoint(model, epoch_checkpoint_path, metadata=epoch_metadata)
+                tqdm.write(f"Saved Phase 3 epoch checkpoint to {epoch_checkpoint_path}")
 
     if trained_examples == 0:
         loss_history_handle.close()
@@ -327,9 +384,12 @@ def main() -> None:
         "action_counts": dict(action_totals),
         "initial_visual_counts": dict(initial_visual_totals),
         "full_context_probability": full_context_probability,
+        "use_one_replay_setting": use_one_replay_setting,
+        "replay_setting": replay_setting,
         "loaded_phase4_vlm": loaded_phase4_vlm,
         "phase4_vlm_checkpoint_path": phase4_vlm_checkpoint_path,
         "phase3_v2": phase3_v2,
+        "phase3_v2_config": dict(phase3_v2_cfg),
         "decision_block_normalized": decision_block_normalized,
         "use_type_loss_weights": use_type_loss_weights,
         "type_loss_weights": type_loss_weights,
@@ -345,6 +405,7 @@ def main() -> None:
         "controller_context_window": model.controller_num_states,
         "controller_max_steps": model.step_embedding.num_embeddings,
         "seed": seed,
+        "checkpoint_every": checkpoint_every,
     }
 
     checkpoint_path = output_dir / "controller_sft.pt"

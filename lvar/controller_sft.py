@@ -366,12 +366,26 @@ def prepare_controller_sft_state(
     return state, bank
 
 
+def replay_setting_uses_full_context(replay_setting: str) -> bool:
+    """Map a named Phase 3 replay setting to the initial visual context mode."""
+    normalized = str(replay_setting).strip().lower()
+    if normalized in {"global", "full", "full_context", "full_image", "full-image"}:
+        return True
+    if normalized in {"coarse", "global_mean", "global-mean", "coarse_context", "coarse-context"}:
+        return False
+    raise ValueError(
+        "replay_setting must be one of: global/full_context/full_image or coarse/global_mean/coarse_context."
+    )
+
+
 def replay_controller_sft_loss(
     model: torch.nn.Module,
     mined_row: Dict[str, Any],
     source_example: Dict[str, Any],
     image_size: Optional[int] = None,
     full_context_probability: float = 0.0,
+    use_one_replay_setting: bool = False,
+    replay_setting: str = "global_mean",
     rng: Optional[random.Random] = None,
     decision_block_normalized: bool = False,
     type_loss_weights: Optional[Dict[str, float]] = None,
@@ -397,7 +411,10 @@ def replay_controller_sft_loss(
     if multi_hot_patch_order_decay <= 0.0 or multi_hot_patch_order_decay > 1.0:
         raise ValueError("multi_hot_patch_order_decay must be in (0, 1].")
     sampler = rng or random
-    use_full_context = sampler.random() < full_context_probability
+    if use_one_replay_setting:
+        use_full_context = replay_setting_uses_full_context(replay_setting)
+    else:
+        use_full_context = sampler.random() < full_context_probability
     state, bank = prepare_controller_sft_state(
         model,
         source_example,
@@ -567,6 +584,8 @@ def replay_controller_sft_loss(
         "logit_stat_counts": dict(logit_stat_counts),
         "initial_visual_mode": "full_context" if use_full_context else "global_mean",
         "used_full_context": use_full_context,
+        "use_one_replay_setting": bool(use_one_replay_setting),
+        "replay_setting": str(replay_setting),
         "decision_block_normalized": decision_block_normalized,
         "multi_hot_patch_labels": bool(multi_hot_patch_labels),
         "multi_hot_patch_target_mode": str(multi_hot_patch_target_mode).strip().lower(),

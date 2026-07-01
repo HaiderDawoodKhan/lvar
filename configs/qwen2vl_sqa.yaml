@@ -26,13 +26,13 @@ model:
     apply_stage: answer_only
   controller_context_window: 3
   use_checkpoint: true
-  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
   use_mrope_position_ids: false
-  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
+  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_sqa/epoch_16_full_model_fp32.pth"
 
 dataset:
-  type: m3cot
-  name: LightChen2333/M3CoT
+  type: sqa
+  name: derek-thomas/ScienceQA
   split: train
   limit:
   require_image: true
@@ -46,14 +46,14 @@ phase2:
   image_size: 280
   resume: true
   start_from_end: false
-  output_path: outputs/phase2_m3cot_traces.jsonl
+  output_path: outputs/phase2_sqa_traces.jsonl
   initial_visual_mode: global_mean
 
 phase3:
   seed: 42
-  trace_path: outputs/phase2_m3cot_traces.jsonl
-  output_dir: outputs/controller_sft_m3cot
-  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/counterfactual_m3cot/counterfactual_epoch_3.pt"
+  trace_path: outputs/phase2_sqa_traces.jsonl
+  output_dir: outputs/controller_sft_sqa
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/counterfactual_sqa/counterfactual_epoch_3.pt"
   controller_lr: 0.0001
   learning_rate: 0.0001
   weight_decay: 0.0
@@ -102,9 +102,9 @@ phase3_v2:
 phase4:
   seed: 42
   training_mode: positive_ce_gold
-  trace_path: outputs/phase2_m3cot_traces.jsonl
-  controller_checkpoint_path: outputs/controller_sft_m3cot/controller_sft.pt
-  output_dir: outputs/traces_m3cot
+  trace_path: outputs/phase2_sqa_traces.jsonl
+  controller_checkpoint_path: outputs/controller_sft_sqa/controller_sft.pt
+  output_dir: outputs/traces_sqa
   controller_lr: 0.0001
   lora_lr: 0.00002
   train_controller: false
@@ -135,9 +135,9 @@ phase4:
 phase5:
   seed: 42
   dataset_partition: validation
-  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"  
-  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
-  output_dir: outputs/grpo_phase5_m3cot
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"  
+  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_sqa/controller_sft.pt"
+  output_dir: outputs/grpo_phase5_sqa
   controller_lr: 0.00005
   weight_decay: 0.0
   num_epochs: 1
@@ -178,11 +178,11 @@ train:
   max_examples:
   grad_clip_norm: 1.0
   log_every: 10
-  output_dir: outputs/train_m3cot
+  output_dir: outputs/train_sqa
 
 inference:
   limit:
-  output_path: outputs/m3cot_lvar_predictions.jsonl
+  output_path: outputs/sqa_lvar_predictions.jsonl
   dataset_partition: test
   # Optional oracle-replay diagnostics. Both are disabled by default.
   track_step_hidden_entropy: false
@@ -190,7 +190,7 @@ inference:
   # Leave null to compute full-vocabulary next-token entropy.
   step_entropy_top_k:
   track_prefix_rollouts: false
-  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
+  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_sqa/controller_sft.pt"
   action_selection: argmax
   mask_immediate_repeats: false
 
