@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 && ( -z "${M3COT_CHECKPOINT_PATH:-}" || -z "${SQA_CHECKPOINT_PATH:-}" ) ]]; then
+if [[ $# -lt 2 && ( -z "${LVAR_CHECKPOINT_PATH:-}" || -z "${IVTLR_CHECKPOINT_PATH:-}" ) ]]; then
   cat <<'USAGE' >&2
 Usage:
-  run_scripts/run_fixed_think_m3cot_sqa_sweep.sh <m3cot_checkpoint> <sqa_checkpoint>
+  run_scripts/run_fixed_think_m3cot_sweep.sh <lvar_checkpoint> <ivtlr_checkpoint>
 
 Environment overrides:
-  M3COT_CHECKPOINT_PATH       M3CoT checkpoint path if not passed as arg 1
-  SQA_CHECKPOINT_PATH         ScienceQA checkpoint path if not passed as arg 2
+  LVAR_CHECKPOINT_PATH        LVAR/M3CoT checkpoint path if not passed as arg 1
+  IVTLR_CHECKPOINT_PATH       IVT-LR/M3CoT checkpoint path if not passed as arg 2
   OUTPUT_ROOT                 Output root, default outputs/inference/fixed_think_sweep
   CONTEXT                     global, coarse, full_context, or global_mean; default global
   IMAGE_SIZE                  Image size passed to inference; default 280
   LIMIT                       Optional dataset limit for quick smoke runs
   SEED                        Optional seed override
   ADD_ANSWER_INSTRUCTION      Set to 1 to append tagged-answer instruction
+  TRACK_LATENT_DEPTH_METRICS  Set to 0 to disable latent attention/hidden metrics
+  ATTN_IMPLEMENTATION         Attention backend for metrics, default eager
 USAGE
   exit 1
 fi
@@ -34,6 +36,8 @@ fi
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/fixed_think_sweep}"
 CONTEXT="${CONTEXT:-global}"
 IMAGE_SIZE="${IMAGE_SIZE:-280}"
+TRACK_LATENT_DEPTH_METRICS="${TRACK_LATENT_DEPTH_METRICS:-1}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-eager}"
 PARTITIONS=(test validation)
 THINK_STEPS=(0 1 2 3 4 5 6 7 8 9 10)
 
@@ -58,6 +62,11 @@ run_one() {
     --checkpoint-path "${checkpoint_path}"
     --output "${output_path}"
   )
+
+  if [[ "${TRACK_LATENT_DEPTH_METRICS}" == "1" ]]; then
+    args+=(--track-latent-depth-metrics)
+    args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+  fi
 
   if [[ -n "${LIMIT:-}" ]]; then
     args+=(--limit "${LIMIT}")

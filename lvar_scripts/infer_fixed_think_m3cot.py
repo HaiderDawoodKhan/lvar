@@ -14,6 +14,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lvar.dataset import build_dataset
+from lvar.latent_depth import (
+    BUCKET_IMAGE,
+    BUCKET_LATENT,
+    BUCKET_PROMPT,
+    aggregate_attention_by_bucket,
+    append_latent_label,
+    compute_hidden_step_metrics,
+    label_initial_positions,
+)
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import verify_choice_output
 from lvar.utils import (
@@ -60,6 +69,8 @@ def apply_fixed_think_steps(
     model: QwenLVAR,
     state: Dict[str, Any],
     num_think_steps: int,
+    labels: Optional[List[str]] = None,
+    track_latent_depth_metrics: bool = False,
 ) -> Dict[str, Any]:
     """
     Apply a fixed number of THINK updates without invoking the controller.
@@ -68,9 +79,56 @@ def apply_fixed_think_steps(
     read the current hidden state, then either append that hidden state as a token
     or update the recurrent control token slots, depending on model config.
     """
+    latent_hidden_vectors: List[torch.Tensor] = []
+    latent_step_attention: List[Dict[str, Any]] = []
     for step_idx in range(int(num_think_steps)):
         sequence_length_before = int(state["inputs_embeds"].size(1))
-        last_hidden, state_hidden, act_hidden = model._read_current_hidden(state)
+        if track_latent_depth_metrics:
+            with torch.no_grad():
+                outputs = model.backbone(
+                    inputs_embeds=state["inputs_embeds"],
+                    attention_mask=state["attention_mask"],
+                    **model._state_position_kwargs(state),
+                    output_hidden_states=True,
+                    output_attentions=True,
+                    return_dict=True,
+                    use_cache=False,
+                )
+            final_hidden = model._extract_final_hidden(outputs)
+            last_hidden = final_hidden[:, -1, :]
+            if model.use_control_tokens:
+                state_hidden = final_hidden[:, state["latent_pos"], :]
+                act_hidden = final_hidden[:, state["act_pos"], :]
+            else:
+                state_hidden = last_hidden
+                act_hidden = None
+            attentions = getattr(outputs, "attentions", None)
+            if not attentions or attentions[-1] is None:
+                raise ValueError(
+                    "Backbone did not return attentions. Set --attn-implementation eager "
+                    "when using --track-latent-depth-metrics."
+                )
+            if labels is None:
+                raise ValueError("labels are required when tracking latent-depth metrics.")
+            query_pos = int(state["latent_pos"]) if model.use_control_tokens and not model.think_append_hidden else sequence_length_before - 1
+            attention_metrics = aggregate_attention_by_bucket(
+                attentions,
+                labels=labels,
+                query_pos=query_pos,
+            )
+            latent_step_attention.append(
+                {
+                    "step_idx": step_idx,
+                    "query_pos": query_pos,
+                    "sequence_length": sequence_length_before,
+                    **attention_metrics,
+                }
+            )
+        else:
+            last_hidden, state_hidden, act_hidden = model._read_current_hidden(state)
+        latent_hidden = state_hidden if model.use_control_tokens and not model.think_append_hidden else last_hidden
+        latent_hidden_vectors.append(latent_hidden.detach())
+
         if model.think_append_hidden:
             model._append_hidden_token(state, last_hidden, track_as_think=True)
         elif model.use_control_tokens:
@@ -97,6 +155,20 @@ def apply_fixed_think_steps(
                 "sequence_length_after": int(state["inputs_embeds"].size(1)),
             }
         )
+        if labels is not None:
+            append_latent_label(labels, sequence_length_before, int(state["inputs_embeds"].size(1)))
+    if track_latent_depth_metrics:
+        state["latent_step_attention"] = latent_step_attention
+        state["latent_step_attention_summary"] = [
+            {
+                "step_idx": row["step_idx"],
+                "image_mass": row["summary"][BUCKET_IMAGE]["mean"],
+                "prompt_mass": row["summary"][BUCKET_PROMPT]["mean"],
+                "latent_mass": row["summary"][BUCKET_LATENT]["mean"],
+            }
+            for row in latent_step_attention
+        ]
+        state["latent_step_hidden_metrics"] = compute_hidden_step_metrics(latent_hidden_vectors)
     return state
 
 
@@ -107,6 +179,7 @@ def fixed_think_decode(
     context_mode: str,
     image_size: Optional[int],
     add_answer_instruction: bool,
+    track_latent_depth_metrics: bool = False,
 ) -> Dict[str, Any]:
     prepared = model.prepare_inputs(
         example["image"],
@@ -121,8 +194,22 @@ def fixed_think_decode(
         state = model.build_coarse_initial_state(prepared, bank)
     else:
         state = model.build_initial_state(prepared)
+    labels = None
+    if track_latent_depth_metrics:
+        labels = label_initial_positions(model, prepared, bank, context_mode=context_mode)
+        if len(labels) != int(state["inputs_embeds"].size(1)):
+            raise ValueError(
+                f"Initial latent-depth label length {len(labels)} does not match "
+                f"sequence length {state['inputs_embeds'].size(1)}."
+            )
     state["sample_actions"] = False
-    state = apply_fixed_think_steps(model, state, num_think_steps=num_think_steps)
+    state = apply_fixed_think_steps(
+        model,
+        state,
+        num_think_steps=num_think_steps,
+        labels=labels,
+        track_latent_depth_metrics=track_latent_depth_metrics,
+    )
     if model.use_control_tokens:
         state = model.drop_act_token(state)
     decoded = model.decode_answer(model._build_decode_state(state))
@@ -130,6 +217,9 @@ def fixed_think_decode(
         **decoded,
         "trace": state["trace"],
         "num_steps": len(state["trace"]),
+        "latent_step_attention": state.get("latent_step_attention"),
+        "latent_step_attention_summary": state.get("latent_step_attention_summary"),
+        "latent_step_hidden_metrics": state.get("latent_step_hidden_metrics"),
     }
 
 
@@ -168,6 +258,8 @@ def build_entropy_tracking_row(
         "trace_attention_mass": decoded.get("trace_attention_mass"),
         "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
         "think_attention_mass": decoded.get("think_attention_mass"),
+        "latent_step_attention_summary": decoded.get("latent_step_attention_summary"),
+        "latent_step_hidden_metrics": decoded.get("latent_step_hidden_metrics"),
     }
 
 
@@ -192,6 +284,12 @@ def main() -> None:
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--add-answer-instruction", action="store_true", default=False)
+    parser.add_argument("--track-latent-depth-metrics", action="store_true", default=False)
+    parser.add_argument(
+        "--attn-implementation",
+        default=None,
+        help="Backbone attention implementation. Use eager when tracking latent-depth metrics.",
+    )
     add_model_loading_args(parser)
     add_trace_boost_args(parser)
     args = parser.parse_args()
@@ -202,6 +300,10 @@ def main() -> None:
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
     config["model"] = apply_trace_boost_overrides(config["model"], args)
+    if args.attn_implementation:
+        config["model"]["attn_implementation"] = args.attn_implementation
+    elif args.track_latent_depth_metrics:
+        config["model"]["attn_implementation"] = "eager"
     dataset_cfg = config["dataset"]
     phase2_cfg = config.get("phase2", {})
     inference_cfg = config.get("inference", {})
@@ -239,6 +341,7 @@ def main() -> None:
         "visual_trace_attention_mass": [],
         "think_attention_mass": [],
     }
+    latent_depth_metric_values: Dict[int, Dict[str, List[float]]] = {}
 
     with open(output_path, "w", encoding="utf-8") as handle:
         for index in tqdm(range(len(dataset)), desc=f"Fixed THINK x{args.num_think_steps}"):
@@ -251,6 +354,7 @@ def main() -> None:
                     context_mode=context_mode,
                     image_size=image_size,
                     add_answer_instruction=bool(args.add_answer_instruction),
+                    track_latent_depth_metrics=bool(args.track_latent_depth_metrics),
                 )
 
             generated_text = decoded["generated_text"]
@@ -269,6 +373,38 @@ def main() -> None:
                 value = decoded.get(key)
                 if value is not None:
                     attention_mass_values[key].append(float(value))
+            for step_row in decoded.get("latent_step_attention_summary") or []:
+                step_idx = int(step_row["step_idx"])
+                metrics = latent_depth_metric_values.setdefault(
+                    step_idx,
+                    {
+                        "image_mass": [],
+                        "prompt_mass": [],
+                        "latent_mass": [],
+                        "hidden_norm": [],
+                        "hidden_norm_delta": [],
+                        "hidden_delta_norm": [],
+                    },
+                )
+                for key in ("image_mass", "prompt_mass", "latent_mass"):
+                    if step_row.get(key) is not None:
+                        metrics[key].append(float(step_row[key]))
+            for step_row in decoded.get("latent_step_hidden_metrics") or []:
+                step_idx = int(step_row["step_idx"])
+                metrics = latent_depth_metric_values.setdefault(
+                    step_idx,
+                    {
+                        "image_mass": [],
+                        "prompt_mass": [],
+                        "latent_mass": [],
+                        "hidden_norm": [],
+                        "hidden_norm_delta": [],
+                        "hidden_delta_norm": [],
+                    },
+                )
+                for key in ("hidden_norm", "hidden_norm_delta", "hidden_delta_norm"):
+                    if step_row.get(key) is not None:
+                        metrics[key].append(float(step_row[key]))
 
             row = {
                 "example_id": example["id"],
@@ -292,6 +428,9 @@ def main() -> None:
                 "trace_attention_mass": decoded.get("trace_attention_mass"),
                 "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
                 "think_attention_mass": decoded.get("think_attention_mass"),
+                "latent_step_attention": decoded.get("latent_step_attention"),
+                "latent_step_attention_summary": decoded.get("latent_step_attention_summary"),
+                "latent_step_hidden_metrics": decoded.get("latent_step_hidden_metrics"),
             }
             write_jsonl_row(handle, row)
             entropy_rows.append(
@@ -322,6 +461,7 @@ def main() -> None:
         "add_answer_instruction": bool(args.add_answer_instruction),
         "image_size": image_size,
         "seed": seed,
+        "track_latent_depth_metrics": bool(args.track_latent_depth_metrics),
         "metrics": {
             "total": total,
             "correct": correct,
@@ -345,6 +485,16 @@ def main() -> None:
                 if attention_mass_values["think_attention_mass"] else None
             ),
         },
+        "latent_depth_metrics_by_step": [
+            {
+                "step_idx": step_idx,
+                **{
+                    key: (sum(values) / len(values) if values else None)
+                    for key, values in metrics.items()
+                },
+            }
+            for step_idx, metrics in sorted(latent_depth_metric_values.items())
+        ],
     }
     summary_path = output_path.with_name(f"{output_path.stem}_summary.json")
     write_json(summary_path, summary)
