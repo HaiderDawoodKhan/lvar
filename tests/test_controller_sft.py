@@ -5,8 +5,10 @@ import torch.nn.functional as F
 
 from lvar.controller_sft import (
     compute_action_loss,
+    compute_patch_sequence_loss,
     flatten_supervised_actions,
     replay_controller_sft_loss,
+    replay_setting_uses_full_context,
 )
 from lvar.utils import ACTION_GLOBAL, ACTION_PATCH, ACTION_REGION, ACTION_STOP, ACTION_THINK
 
@@ -66,6 +68,123 @@ class TinyReplayModel(torch.nn.Module):
 
 
 class ControllerSFTTests(unittest.TestCase):
+    def test_binary_multi_hot_patch_sequence_uses_one_patch_head_target(self):
+        type_logits = torch.zeros((1, 5))
+        patch_logits = torch.zeros((1, 4))
+        actions = [
+            {"type": "PATCH", "patch_idx": 0},
+            {"type": "PATCH", "patch_idx": 2},
+            {"type": "PATCH", "patch_idx": 3},
+        ]
+
+        loss, components = compute_patch_sequence_loss(
+            type_logits,
+            patch_logits,
+            actions,
+            target_mode="binary",
+        )
+        target = torch.tensor([[1.0, 0.0, 1.0, 1.0]])
+        expected = F.cross_entropy(type_logits, torch.tensor([ACTION_PATCH])) + F.binary_cross_entropy_with_logits(
+            patch_logits,
+            target,
+        )
+
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertTrue(torch.allclose(components["patch_loss"], F.binary_cross_entropy_with_logits(patch_logits, target)))
+
+    def test_ordered_patch_sequence_gives_earlier_indices_more_target_mass(self):
+        type_logits = torch.zeros((1, 5))
+        patch_logits = torch.tensor([[3.0, 0.0, 1.0, 2.0]])
+        actions = [
+            {"type": "PATCH", "patch_idx": 0},
+            {"type": "PATCH", "patch_idx": 3},
+            {"type": "PATCH", "patch_idx": 2},
+        ]
+
+        loss, components = compute_patch_sequence_loss(
+            type_logits,
+            patch_logits,
+            actions,
+            target_mode="ordered",
+            order_decay=0.5,
+        )
+        target = torch.tensor([[1.0, 0.0, 0.25, 0.5]])
+        target = target / target.sum()
+        expected_patch = -(target * F.log_softmax(patch_logits, dim=-1)).sum()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.allclose(components["patch_loss"], expected_patch))
+
+    def test_replay_collapses_patch_sequence_to_one_controller_target(self):
+        model = TinyReplayModel()
+        mined_row = {
+            "example_id": "ex-1",
+            "decisions": [
+                {
+                    "selected": "PATCH_SEQ",
+                    "actions": [
+                        {"type": "PATCH", "patch_idx": 0},
+                        {"type": "PATCH", "patch_idx": 2},
+                        {"type": "PATCH", "patch_idx": 3},
+                    ],
+                },
+                {"selected": "THINK", "actions": [{"type": "THINK"}]},
+            ],
+        }
+        source_example = {"id": "ex-1", "image": "image", "question": "question"}
+
+        loss, metrics = replay_controller_sft_loss(
+            model,
+            mined_row,
+            source_example,
+            multi_hot_patch_labels=True,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(model.seen_steps, [0, 1, 2])
+        self.assertEqual(model.applied_actions, ["PATCH", "PATCH", "PATCH", "THINK"])
+        self.assertEqual(metrics["action_counts"], {"PATCH": 1, "THINK": 1, "STOP": 1})
+        self.assertEqual(metrics["multi_hot_patch_blocks"], 1)
+        self.assertEqual(metrics["multi_hot_patch_indices"], 3)
+        self.assertEqual(metrics["num_primitive_targets"], 5)
+
+    def test_single_replay_setting_forces_initial_context_mode(self):
+        mined_row = {
+            "example_id": "ex-1",
+            "decisions": [{"selected": "THINK", "actions": [{"type": "THINK"}]}],
+        }
+        source_example = {"id": "ex-1", "image": "image", "question": "question"}
+
+        global_model = TinyReplayModel()
+        _, global_metrics = replay_controller_sft_loss(
+            global_model,
+            mined_row,
+            source_example,
+            full_context_probability=0.0,
+            use_one_replay_setting=True,
+            replay_setting="global",
+        )
+        self.assertEqual(global_model.initial_modes, ["full_context"])
+        self.assertTrue(global_metrics["used_full_context"])
+
+        coarse_model = TinyReplayModel()
+        _, coarse_metrics = replay_controller_sft_loss(
+            coarse_model,
+            mined_row,
+            source_example,
+            full_context_probability=1.0,
+            use_one_replay_setting=True,
+            replay_setting="coarse",
+        )
+        self.assertEqual(coarse_model.initial_modes, ["global_mean"])
+        self.assertFalse(coarse_metrics["used_full_context"])
+
+    def test_replay_setting_validation(self):
+        self.assertTrue(replay_setting_uses_full_context("full_context"))
+        self.assertFalse(replay_setting_uses_full_context("global_mean"))
+        with self.assertRaises(ValueError):
+            replay_setting_uses_full_context("bad-mode")
+        
     def test_flatten_actions_skips_noop_decisions_and_appends_stop(self):
         decisions = [
             {"selected": "PATCH_SEQ", "actions": [{"type": "PATCH", "patch_idx": 2}, {"type": "PATCH", "patch_idx": 1}]},

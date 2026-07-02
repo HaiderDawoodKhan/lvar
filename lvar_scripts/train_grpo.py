@@ -129,6 +129,12 @@ def main() -> None:
     """Train Phase 5 controller refinement with clipped GRPO."""
     parser = argparse.ArgumentParser(description="Train Phase 5 GRPO controller refinement.")
     parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save intermediate epoch checkpoints every N epochs. Use 0 to disable epoch checkpoints.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -142,7 +148,11 @@ def main() -> None:
     if "controller_max_steps" in train_cfg:
         config["model"]["controller_max_steps"] = int(train_cfg["controller_max_steps"])
         config["model"]["max_steps"] = int(train_cfg["controller_max_steps"])
-    if bool(config.get("phase3", {}).get("phase3_v2", False)) or bool(config.get("phase3", {}).get("remove_global", False)):
+    phase3_cfg = config.get("phase3", {})
+    phase3_v2_cfg = config.get("phase3_v2", {})
+    phase3_v2_enabled = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
+    phase3_v2_removes_global = bool(phase3_v2_cfg.get("remove_global", phase3_cfg.get("remove_global", True)))
+    if phase3_v2_enabled and phase3_v2_removes_global:
         config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in config.get("inference", {}):
         config["model"]["mask_immediate_repeats"] = bool(config["inference"]["mask_immediate_repeats"])
@@ -198,6 +208,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     num_epochs = int(train_cfg.get("num_epochs", 1))
+    checkpoint_every = int(
+        args.checkpoint_every
+        if args.checkpoint_every is not None
+        else train_cfg.get("checkpoint_every", 1)
+    )
+    if checkpoint_every < 0:
+        raise ValueError("phase5.checkpoint_every / --checkpoint-every must be >= 0.")
     group_size = int(train_cfg.get("group_size", 6))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
     log_every = int(train_cfg.get("log_every", 10))
@@ -395,7 +412,8 @@ def main() -> None:
                     f"grad_norm={last_diagnostics['grad_norm']:.4f} "
                     f"metrics={metric_tracker.summary()} "
                 )
-        if accelerator.is_local_main_process:
+        should_checkpoint_epoch = checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0
+        if should_checkpoint_epoch and accelerator.is_local_main_process:
             epoch_checkpoint_path = output_dir / f"phase5_controller_epoch_{epoch + 1}.pt"
             save_phase5_checkpoint(
                 model,
@@ -409,6 +427,7 @@ def main() -> None:
                     "controller_checkpoint_path": controller_checkpoint_path,
                     "dataset_partition": dataset_partition,
                     "metrics": metric_tracker.summary(),
+                    "checkpoint_every": checkpoint_every,
                 },
             )
 
@@ -426,6 +445,7 @@ def main() -> None:
                 "controller_checkpoint_path": controller_checkpoint_path,
                 "dataset_partition": dataset_partition,
                 "metrics": metric_tracker.summary(),
+                "checkpoint_every": checkpoint_every,
             },
         )
 

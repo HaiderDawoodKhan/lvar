@@ -83,10 +83,13 @@ def main() -> None:
     dataset_cfg = config["dataset"]
     debug_cfg = config.get("debug", {})
     phase3_cfg = config.get("phase3", {})
+    phase3_v2_cfg = config.get("phase3_v2", {})
     phase5_cfg = config.get("phase5", {})
     inference_cfg = config.get("inference", {})
 
-    use_no_global_controller = bool(phase3_cfg.get("phase3_v2", False)) or bool(phase3_cfg.get("remove_global", False))
+    phase3_v2_enabled = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
+    phase3_v2_removes_global = bool(phase3_v2_cfg.get("remove_global", phase3_cfg.get("remove_global", True)))
+    use_no_global_controller = phase3_v2_enabled and phase3_v2_removes_global
     if use_no_global_controller:
         config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in inference_cfg:

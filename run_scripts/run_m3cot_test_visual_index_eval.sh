@@ -6,6 +6,8 @@ IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/out
 LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
+GLOBAL_REPLAY_CONTEXT="${GLOBAL_REPLAY_CONTEXT:-global}"
+COARSE_REPLAY_CONTEXT="${COARSE_REPLAY_CONTEXT:-coarse}"
 
 for checkpoint in "${IVTLR_CHECKPOINT}" "${LVAR_PHASE1_CHECKPOINT}"; do
   if [[ ! -f "${checkpoint}" ]]; then
@@ -23,6 +25,10 @@ eval_visual_index_modes() {
   local model_key="$1"
   local checkpoint_path="$2"
   local context_label="$3"
+  local replay_context_label="${GLOBAL_REPLAY_CONTEXT}"
+  if [[ "${context_label}" == "coarse" ]]; then replay_context_label="${COARSE_REPLAY_CONTEXT}"; fi
+  local replay_suffix=""
+  if [[ "${replay_context_label}" != "${context_label}" ]]; then replay_suffix="_replayed-under_${replay_context_label}"; fi
   local trace_path="outputs/oracle_dataset/test/${model_key}_ckpt/m3cot_test_traces_${model_key}_${context_label}.jsonl"
   local visual_index_modes=("random" "last")
 
@@ -33,7 +39,7 @@ eval_visual_index_modes() {
 
   for visual_index_mode in "${visual_index_modes[@]}"; do
     local inference_dir="outputs/inference/test_oracle_visual_index/mined_by_${model_key}_ckpt/evaluated_by_${model_key}_ckpt/context_${context_label}/visual_index_mode_${visual_index_mode}"
-    local output_path="${inference_dir}/m3cot_test_predictions_mined-by_${model_key}_evaluated-by_${model_key}_${context_label}_raw_${visual_index_mode}.jsonl"
+    local output_path="${inference_dir}/m3cot_test_predictions_mined-by_${model_key}_evaluated-by_${model_key}_${context_label}_raw_${visual_index_mode}${replay_suffix}.jsonl"
 
     mkdir -p "${inference_dir}"
     echo "Evaluating ${model_key} ${context_label} trace with visual-index mode ${visual_index_mode}..."
@@ -41,7 +47,7 @@ eval_visual_index_modes() {
       --config "${CONFIG}" \
       --dataset-partition test \
       --checkpoint-path "${checkpoint_path}" \
-      --context "${context_label}" \
+      --context "${replay_context_label}" \
       --trace-variant raw \
       --visual-index-mode "${visual_index_mode}" \
       --seed "${SEED}" \

@@ -4,7 +4,7 @@ model:
   dtype: auto
   max_steps: 32
   region_window: 2
-  max_answer_tokens: 32
+  max_answer_tokens: 256
   action_selection: sample
   controller_temperature: 1.0
   controller_index_temperature: 0.07
@@ -27,6 +27,7 @@ model:
   controller_context_window: 3
   use_checkpoint: true
   checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  use_mrope_position_ids: false
   # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
 
 dataset:
@@ -52,27 +53,28 @@ phase3:
   seed: 42
   trace_path: outputs/phase2_m3cot_traces.jsonl
   output_dir: outputs/controller_sft_m3cot
-  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/counterfactual_m3cot/counterfactual_epoch_3.pt"
-  phase3_v2: false
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
   controller_lr: 0.0001
-  learning_rate: 0.0001
+  learning_rate: 0.0005
   weight_decay: 0.0
-  num_epochs: 6
+  num_epochs: 20
+  # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
+  checkpoint_every: 10
   max_examples:
   grad_clip_norm: 1.0
   log_every: 100
   image_size: 280
   controller_max_steps: 32
   full_context_probability: 0.25
-  remove_global: true
-  mask_immediate_repeats: true
+  # If false, examples randomly use full context with full_context_probability
+  # and otherwise use the coarse/global-mean context.
+  # If true, every example uses replay_setting.
+  use_one_replay_setting: false
+  # global/full_context/full_image -> full image context.
+  # coarse/global_mean/coarse_context -> pooled global-mean context.
+  replay_setting: global_mean
   decision_block_normalized: true
-  visual_or_region_min_improvement: 0.04
-  think_min_improvement: 0.03
-  max_decision_blocks_per_example: 6
-  max_primitive_actions_per_example: 8
-  no_op_stop_ce_threshold: 0.05
-  visual_block_dropout_p: 0.05
+  visual_block_dropout_p: 0.0
   multi_hot_patch_labels: false
   # binary: BCE against 1s at every selected patch; ordered: rank-decayed soft target.
   multi_hot_patch_target_mode: binary
@@ -84,6 +86,18 @@ phase3:
     THINK: 5.0
     GLOBAL: 1.0
     STOP: 5.0
+
+phase3_v2:
+  # V2-only trace filtering/capping settings. These are ignored unless
+  # phase3_v2.enabled is true.
+  enabled: false
+  remove_global: true
+  mask_immediate_repeats: true
+  visual_or_region_min_improvement: 0.04
+  think_min_improvement: 0.03
+  max_decision_blocks_per_example: 6
+  max_primitive_actions_per_example: 8
+  no_op_stop_ce_threshold: 0.05
 
 phase4:
   seed: 42
@@ -100,6 +114,8 @@ phase4:
   sample_controller_actions: false
   weight_decay: 0.0
   num_epochs: 2
+  # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
+  checkpoint_every: 1
   max_pairs:
   grad_clip_norm: 1.0
   log_every: 10
@@ -119,13 +135,14 @@ phase4:
 phase5:
   seed: 42
   dataset_partition: validation
-  phase4_vlm_checkpoint_path: None
-  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
   controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   output_dir: outputs/grpo_phase5_m3cot
   controller_lr: 0.00005
   weight_decay: 0.0
   num_epochs: 1
+  # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
+  checkpoint_every: 1
   max_examples:
   group_size: 6
   update_epochs: 1
@@ -175,7 +192,7 @@ inference:
   track_prefix_rollouts: false
   controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   action_selection: argmax
-  mask_immediate_repeats: true
+  mask_immediate_repeats: false
 
 debug:
   index: 0

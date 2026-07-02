@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.mine_phase2 import iter_dataset_indices, read_completed_example_ids
+from lvar_scripts.mine_phase2 import iter_dataset_indices, read_completed_example_ids
 
 
 class MinePhase2ScriptTests(unittest.TestCase):

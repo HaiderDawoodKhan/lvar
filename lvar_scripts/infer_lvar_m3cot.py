@@ -112,8 +112,8 @@ def main() -> None:
     parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
-    parser.add_argument("--phase4-vlm-checkpoint-path", default=None)
-    parser.add_argument("--controller-checkpoint-path", default=None)
+    parser.add_argument("--vlm-path", default=None)
+    parser.add_argument("--controller-path", default=None)
     parser.add_argument("--use-coarse-context", action="store_true", default=False)
     parser.add_argument(
         "--nucleus-insertion",
@@ -124,7 +124,7 @@ def main() -> None:
     parser.add_argument("--nucleus-insertion-scope", choices=["patch", "region", "both"], default=None)
     parser.add_argument("--nucleus-insertion-top-p", type=float, default=None)
     parser.add_argument("--nucleus-insertion-max-indices", type=int, default=None)
-    parser.add_argument("--use_validation_set", action="store_true", help="Use validation set for inference")
+    parser.add_argument("--use-validation-set", action="store_true", help="Use validation set for inference")
     add_model_loading_args(parser)
     add_trace_boost_args(parser)
     args = parser.parse_args()
@@ -138,7 +138,11 @@ def main() -> None:
 
     if "action_selection" in inference_cfg:
         config["model"]["action_selection"] = inference_cfg["action_selection"]
-    if bool(config.get("phase3", {}).get("phase3_v2", False)) or bool(config.get("phase3", {}).get("remove_global", False)):
+    phase3_cfg = config.get("phase3", {})
+    phase3_v2_cfg = config.get("phase3_v2", {})
+    phase3_v2_enabled = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
+    phase3_v2_removes_global = bool(phase3_v2_cfg.get("remove_global", phase3_cfg.get("remove_global", True)))
+    if phase3_v2_enabled and phase3_v2_removes_global:
         config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in inference_cfg:
         config["model"]["mask_immediate_repeats"] = bool(inference_cfg["mask_immediate_repeats"])
@@ -173,7 +177,7 @@ def main() -> None:
 
     model = QwenLVAR(config["model"])
 
-    phase4_vlm_checkpoint_path = args.phase4_vlm_checkpoint_path or inference_cfg.get(
+    phase4_vlm_checkpoint_path = args.vlm_path or inference_cfg.get(
         "phase4_vlm_checkpoint_path",
         config.get("phase5", {}).get("phase4_vlm_checkpoint_path", ""),
     )
@@ -184,7 +188,7 @@ def main() -> None:
         else:
             print(f"Phase 4 VLM LoRA checkpoint not found: {phase4_vlm_checkpoint_path}")
 
-    controller_checkpoint_path = args.controller_checkpoint_path or inference_cfg.get(
+    controller_checkpoint_path = args.controller_path or inference_cfg.get(
         "controller_checkpoint_path",
         config.get("phase5", {}).get("controller_checkpoint_path", ""),
     )

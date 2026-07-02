@@ -11,7 +11,7 @@ from lvar.grpo_training import (
     target_logprob,
 )
 from lvar.utils import ACTION_PATCH, ACTION_REGION, ACTION_STOP
-from scripts.train_grpo import asymmetric_baseline_weight, compute_grpo_policy_loss
+from lvar_scripts.train_grpo import asymmetric_baseline_weight, compute_grpo_policy_loss
 from test_model import build_model
 
 

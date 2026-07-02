@@ -52,6 +52,9 @@ def verify_choice_output(generated_text: str, gold_answer: str) -> bool:
     candidates = extract_choice_candidates(generated_text)
     if candidates:
         return gt_answer in candidates
+    generated_choice = _normalize_gold_choice(normalize_answer(generated_text))
+    if len(gt_answer) == 1 and len(generated_choice) == 1:
+        return generated_choice == gt_answer
     return normalize_answer(generated_text) == normalize_answer(gold_answer)
 
 

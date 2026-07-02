@@ -1,0 +1,198 @@
+model:
+  model_id: Qwen/Qwen2-VL-2B-Instruct
+  device: auto
+  dtype: auto
+  max_steps: 32
+  region_window: 2
+  max_answer_tokens: 256
+  action_selection: sample
+  controller_temperature: 1.0
+  controller_index_temperature: 0.07
+  nucleus_insertion_enabled: false
+  # patch, region, or both
+  nucleus_insertion_scope: both
+  nucleus_insertion_top_p: 0.9
+  nucleus_insertion_max_indices: 4
+  controller_num_regions: 25
+  controller_num_patches: 100
+  pooling: mean
+  use_control_tokens: false
+  think_append_hidden: true
+  trace_boost:
+    enabled: false
+    target: trace_visual
+    layer_mode: latter_half
+    alpha: 0.2
+    apply_stage: answer_only
+  controller_context_window: 3
+  use_checkpoint: true
+  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/lvar_sqa_phase_1/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  use_mrope_position_ids: false
+  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_sqa/epoch_16_full_model_fp32.pth"
+
+dataset:
+  type: sqa
+  name: derek-thomas/ScienceQA
+  split: train
+  limit:
+  require_image: true
+  max_latent_stage: 20
+
+phase2:
+  seed: 42
+  selection_delta: 0.03
+  patch_k_choices: [1, 2, 3, 4]
+  max_steps: 8
+  image_size: 280
+  resume: true
+  start_from_end: false
+  output_path: outputs/phase2_sqa_traces.jsonl
+  initial_visual_mode: global_mean
+
+phase3:
+  seed: 42
+  trace_path: outputs/phase2_sqa_traces.jsonl
+  output_dir: outputs/controller_sft_sqa
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/counterfactual_sqa/counterfactual_epoch_3.pt"
+  controller_lr: 0.0001
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  num_epochs: 20
+  # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
+  checkpoint_every: 10
+  max_examples:
+  grad_clip_norm: 1.0
+  log_every: 100
+  image_size: 280
+  controller_max_steps: 32
+  full_context_probability: 0.25
+  # If false, examples randomly use full context with full_context_probability
+  # and otherwise use the coarse/global-mean context.
+  # If true, every example uses replay_setting.
+  use_one_replay_setting: false
+  # global/full_context/full_image -> full image context.
+  # coarse/global_mean/coarse_context -> pooled global-mean context.
+  replay_setting: global_mean
+  decision_block_normalized: true
+  visual_block_dropout_p: 0.0
+  multi_hot_patch_labels: false
+  # binary: BCE against 1s at every selected patch; ordered: rank-decayed soft target.
+  multi_hot_patch_target_mode: binary
+  multi_hot_patch_order_decay: 0.5
+  use_type_loss_weights: true
+  type_loss_weights:
+    PATCH: 1.0
+    REGION: 2.5
+    THINK: 5.0
+    GLOBAL: 1.0
+    STOP: 5.0
+
+phase3_v2:
+  # V2-only trace filtering/capping settings. These are ignored unless
+  # phase3_v2.enabled is true.
+  enabled: false
+  remove_global: true
+  mask_immediate_repeats: true
+  visual_or_region_min_improvement: 0.04
+  think_min_improvement: 0.03
+  max_decision_blocks_per_example: 6
+  max_primitive_actions_per_example: 8
+  no_op_stop_ce_threshold: 0.05
+
+phase4:
+  seed: 42
+  training_mode: positive_ce_gold
+  trace_path: outputs/phase2_sqa_traces.jsonl
+  controller_checkpoint_path: outputs/controller_sft_sqa/controller_sft.pt
+  output_dir: outputs/traces_sqa
+  controller_lr: 0.0001
+  lora_lr: 0.00002
+  train_controller: false
+  controller_loss_weight: 0.0
+  positive_ce_gold_probability: 0.4
+  max_controller_steps: 32
+  sample_controller_actions: false
+  weight_decay: 0.0
+  num_epochs: 2
+  # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
+  checkpoint_every: 1
+  max_pairs:
+  grad_clip_norm: 1.0
+  log_every: 10
+  image_size: 280
+  controller_max_steps: 32
+  context_full_probability: 0.25
+  negative_type_probs:
+    same_image_wrong: 0.5
+    different_image_random: 0.35
+    same_image_noisy: 0.15
+  rank_margin: 0.1
+  positive_ce_weight: 0.2
+  rank_weight: 0.3
+  rank_target: answer
+  noise_scale: 0.5
+
+phase5:
+  seed: 42
+  dataset_partition: validation
+  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/lvar_sqa_phase_1/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"  
+  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_sqa/controller_sft.pt"
+  output_dir: outputs/grpo_phase5_sqa
+  controller_lr: 0.00005
+  weight_decay: 0.0
+  num_epochs: 1
+  # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
+  checkpoint_every: 1
+  max_examples:
+  group_size: 6
+  update_epochs: 1
+  grad_clip_norm: 1.0
+  log_every: 1
+  image_size: 280
+  controller_max_steps: 32
+  max_controller_steps: 32
+  rollout_temperature: 1.5
+  clip_epsilon: 0.2
+  logp_weight: 0.05
+  counterfactual_weight: 0.3
+  use_counterfactual_reward: true
+  cf_random_image_probability: 0.35
+  no_stop_penalty: 0.2
+  no_visual_penalty: 0.3
+  early_stop_penalty: 0.3
+  min_controller_actions_before_stop: 3
+  min_visual_actions_before_stop: 1
+  think_once_bonus: 0.1
+  advantage_epsilon: 0.000001
+  improve_weight: 1.5
+  miss_weight: 1.0
+  already_correct_weight: 0.5
+  regression_weight: 1.5
+
+train:
+  seed: 42
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  num_epochs: 1
+  group_size: 4
+  max_examples:
+  grad_clip_norm: 1.0
+  log_every: 10
+  output_dir: outputs/train_sqa
+
+inference:
+  limit:
+  output_path: outputs/sqa_lvar_predictions.jsonl
+  dataset_partition: test
+  # Optional oracle-replay diagnostics. Both are disabled by default.
+  track_step_hidden_entropy: false
+  # Set to a positive integer (for example 50) to renormalize over only top-k tokens.
+  # Leave null to compute full-vocabulary next-token entropy.
+  step_entropy_top_k:
+  track_prefix_rollouts: false
+  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_sqa/controller_sft.pt"
+  action_selection: argmax
+  mask_immediate_repeats: false
+
+debug:
+  index: 0

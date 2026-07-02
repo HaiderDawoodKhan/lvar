@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lvar.dataset import build_dataset
+from lvar.grpo_training import load_controller_checkpoint
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import verify_choice_output
 from lvar.utils import (
@@ -96,6 +97,22 @@ def build_entropy_tracking_row(
         "decoded_token_entropy_mean": decoded["token_entropy_mean"],
         "decoded_token_entropy_median": decoded["token_entropy_median"],
         "decoded_token_entropy_max": decoded["token_entropy_max"],
+        "controller_action_entropies": decoded.get("controller_action_entropy_values", []),
+        "controller_action_entropy_mean": decoded.get("controller_action_entropy_mean"),
+        "controller_action_entropy_median": decoded.get("controller_action_entropy_median"),
+        "controller_action_entropy_max": decoded.get("controller_action_entropy_max"),
+        "controller_region_entropies": decoded.get("controller_region_entropy_values", []),
+        "controller_region_entropy_mean": decoded.get("controller_region_entropy_mean"),
+        "controller_region_entropy_median": decoded.get("controller_region_entropy_median"),
+        "controller_region_entropy_max": decoded.get("controller_region_entropy_max"),
+        "controller_patch_entropies": decoded.get("controller_patch_entropy_values", []),
+        "controller_patch_entropy_mean": decoded.get("controller_patch_entropy_mean"),
+        "controller_patch_entropy_median": decoded.get("controller_patch_entropy_median"),
+        "controller_patch_entropy_max": decoded.get("controller_patch_entropy_max"),
+        "controller_entropies": decoded.get("controller_entropy_values", []),
+        "controller_entropy_mean": decoded.get("controller_entropy_mean"),
+        "controller_entropy_median": decoded.get("controller_entropy_median"),
+        "controller_entropy_max": decoded.get("controller_entropy_max"),
         "trace_attention_mass": decoded.get("trace_attention_mass"),
         "visual_trace_attention_mass": decoded.get("visual_trace_attention_mass"),
         "think_attention_mass": decoded.get("think_attention_mass"),
@@ -143,6 +160,30 @@ def rewrite_visual_action_index(
     return rewritten
 
 
+def normalize_replay_action(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize mined traces and model controller traces to replay action schema."""
+    normalized = dict(action)
+    action_type = str(
+        normalized.get("type")
+        or normalized.get("action")
+        or normalized.get("label")
+        or ""
+    ).upper()
+    normalized["type"] = action_type
+
+    if "region_idx" not in normalized:
+        if normalized.get("region_index") is not None:
+            normalized["region_idx"] = normalized["region_index"]
+        elif normalized.get("region_indices"):
+            normalized["region_idx"] = normalized["region_indices"][0]
+    if "patch_idx" not in normalized:
+        if normalized.get("patch_index") is not None:
+            normalized["patch_idx"] = normalized["patch_index"]
+        elif normalized.get("patch_indices"):
+            normalized["patch_idx"] = normalized["patch_indices"][0]
+    return normalized
+
+
 def collect_dataset_by_id(dataset: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     examples_by_id: Dict[str, Dict[str, Any]] = {}
     for index in range(len(dataset)):  # type: ignore[arg-type]
@@ -167,7 +208,7 @@ def is_visual_block(actions: List[Dict[str, Any]]) -> bool:
 
 def flatten_replay_blocks(blocks: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Flatten decision-level replay blocks into primitive controller actions."""
-    return [dict(action) for block in blocks for action in (block.get("actions") or [])]
+    return [normalize_replay_action(action) for block in blocks for action in (block.get("actions") or [])]
 
 
 def raw_replay_blocks(trace_row: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -176,13 +217,13 @@ def raw_replay_blocks(trace_row: Dict[str, Any]) -> List[Dict[str, Any]]:
     blocks = [
         {
             "label": str(decision.get("selected") or "").upper(),
-            "actions": [dict(action) for action in (decision.get("actions") or [])],
+            "actions": [normalize_replay_action(action) for action in (decision.get("actions") or [])],
         }
         for decision in decisions
         if decision.get("actions")
     ]
     decision_trace = flatten_replay_blocks(blocks)
-    raw_trace = [dict(action) for action in (trace_row.get("trace") or [])]
+    raw_trace = [normalize_replay_action(action) for action in (trace_row.get("trace") or [])]
     raw_without_stop = [action for action in raw_trace if str(action.get("type", "")).upper() != "STOP"]
     if not blocks or decision_trace != raw_without_stop:
         blocks = [
@@ -367,9 +408,12 @@ def next_token_entropy_from_state(
     top_k: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Measure next-token LM-head entropy after an oracle action block is inserted."""
+    position_kwargs_fn = getattr(model, "_state_position_kwargs", None)
+    position_kwargs = position_kwargs_fn(state) if callable(position_kwargs_fn) else {}
     outputs = model.backbone(
         inputs_embeds=state["inputs_embeds"],
         attention_mask=state["attention_mask"],
+        **position_kwargs,
         output_hidden_states=False,
         return_dict=True,
         use_cache=False,
@@ -422,15 +466,84 @@ def decode_without_reasoning(
     image_tokens = model.get_projected_image_tokens(prepared)
     prepared["projected_image_tokens"] = image_tokens
     inputs_embeds, attention_mask = model._build_multimodal_embeddings(prepared)
+    position_ids, rope_deltas = model._compute_reference_position_ids(prepared)
     state = {
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "rope_deltas": rope_deltas,
         "latent_pos": None,
         "act_pos": None,
         "trace_all_positions": [],
         "trace_visual_positions": [],
     }
     return model.decode_answer(state)
+
+
+def measure_forced_controller_step(
+    model: QwenLVAR,
+    state: Dict[str, Any],
+    bank: Dict[str, torch.Tensor],
+    action: Dict[str, Any],
+    step_idx: int,
+) -> Dict[str, Any]:
+    """Measure current controller uncertainty before forcing a replay action."""
+    type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
+    scaled_type_logits = model._scale_controller_logits(type_logits)
+    scaled_region_logits = model._scale_controller_logits(region_logits)
+    scaled_patch_logits = model._scale_controller_logits(patch_logits)
+
+    if model.mask_immediate_repeats and state.get("last_action") == "REGION":
+        last_regions = state.get("last_region_indices")
+        if not isinstance(last_regions, list):
+            last_region = state.get("last_region_index")
+            last_regions = [last_region] if isinstance(last_region, int) else []
+        if last_regions and scaled_region_logits.size(-1) > len(last_regions):
+            scaled_region_logits = scaled_region_logits.clone()
+            for last_region in last_regions:
+                if 0 <= int(last_region) < scaled_region_logits.size(-1):
+                    scaled_region_logits[:, int(last_region)] = torch.finfo(scaled_region_logits.dtype).min
+
+    if model.mask_immediate_repeats and state.get("last_action") == "PATCH":
+        last_patches = state.get("last_patch_indices")
+        if not isinstance(last_patches, list):
+            last_patch = state.get("last_patch_index")
+            last_patches = [last_patch] if isinstance(last_patch, int) else []
+        if last_patches and scaled_patch_logits.size(-1) > len(last_patches):
+            scaled_patch_logits = scaled_patch_logits.clone()
+            for last_patch in last_patches:
+                if 0 <= int(last_patch) < scaled_patch_logits.size(-1):
+                    scaled_patch_logits[:, int(last_patch)] = torch.finfo(scaled_patch_logits.dtype).min
+
+    action_type = str(action.get("type", "")).upper()
+    action_id = model.action_name_to_id.get(action_type)
+    metrics = {
+        "action_id": action_id,
+        "action_names": model.action_names,
+        "action_probs": model._distribution_to_list(scaled_type_logits),
+        "region_probs": model._distribution_to_list(scaled_region_logits),
+        "patch_probs": model._distribution_to_list(scaled_patch_logits),
+        **model._controller_head_entropies(
+            scaled_type_logits,
+            scaled_region_logits,
+            scaled_patch_logits,
+        ),
+        "controller_temperature": model.controller_temperature,
+    }
+    if action_id is not None:
+        action_log_probs = torch.log_softmax(scaled_type_logits.float(), dim=-1)
+        metrics["forced_action_log_prob"] = float(action_log_probs[:, int(action_id)].detach().cpu().item())
+    if action_type == "REGION" and action.get("region_idx") is not None:
+        region_idx = int(action["region_idx"])
+        if 0 <= region_idx < scaled_region_logits.size(-1):
+            region_log_probs = torch.log_softmax(scaled_region_logits.float(), dim=-1)
+            metrics["forced_index_log_prob"] = float(region_log_probs[:, region_idx].detach().cpu().item())
+    if action_type == "PATCH" and action.get("patch_idx") is not None:
+        patch_idx = int(action["patch_idx"])
+        if 0 <= patch_idx < scaled_patch_logits.size(-1):
+            patch_log_probs = torch.log_softmax(scaled_patch_logits.float(), dim=-1)
+            metrics["forced_index_log_prob"] = float(patch_log_probs[:, patch_idx].detach().cpu().item())
+    return metrics
 
 
 def replay_trace_and_decode(
@@ -489,6 +602,7 @@ def replay_trace_and_decode(
         rewritten_actions = []
         terminal = False
         for action in block_actions:
+            action = normalize_replay_action(action)
             action_type = str(action.get("type", "")).upper()
             replay_action = rewrite_visual_action_index(
                 action,
@@ -498,6 +612,13 @@ def replay_trace_and_decode(
                 rng=rng,
             )
             before = int(state["inputs_embeds"].size(1))
+            controller_metrics = measure_forced_controller_step(
+                model=model,
+                state=state,
+                bank=bank,
+                action=replay_action,
+                step_idx=primitive_step_idx,
+            )
             model.apply_mined_actions(state, bank, [replay_action])
             after = int(state["inputs_embeds"].size(1))
             step_info = {
@@ -507,6 +628,7 @@ def replay_trace_and_decode(
                 "action": action_type,
                 "sequence_length_before": before,
                 "sequence_length_after": after,
+                **controller_metrics,
             }
             if replay_action.get("region_idx") is not None:
                 step_info["region_index"] = int(replay_action["region_idx"])
@@ -518,6 +640,11 @@ def replay_trace_and_decode(
                     step_info["source_patch_index"] = int(action["patch_idx"])
             replayed_trace.append(step_info)
             rewritten_actions.append(dict(replay_action))
+            state["last_action"] = action_type
+            state["last_region_index"] = step_info.get("region_index")
+            state["last_patch_index"] = step_info.get("patch_index")
+            state["last_region_indices"] = [step_info["region_index"]] if step_info.get("region_index") is not None else []
+            state["last_patch_indices"] = [step_info["patch_index"]] if step_info.get("patch_index") is not None else []
             primitive_step_idx += 1
             if action_type == "STOP":
                 terminal = True
@@ -568,6 +695,7 @@ def replay_trace_and_decode(
 
     with torch.no_grad():
         decoded = decode_current_replay_state(model, state)
+    controller_entropy_tracking = model._controller_entropy_tracking(replayed_trace)
     return {
         "generated_text": decoded["generated_text"],
         "answer": decoded["answer"],
@@ -586,6 +714,7 @@ def replay_trace_and_decode(
         "action_prefix_metrics": action_prefix_metrics,
         "decode_prefix_length": decoded["decode_prefix_length"],
         "final_sequence_length": decoded["final_sequence_length"],
+        **controller_entropy_tracking,
     }
 
 
@@ -643,6 +772,11 @@ def main() -> None:
         default=None,
         help="Decode and score a complete answer after every inserted oracle action block.",
     )
+    parser.add_argument(
+        "--controller-path",
+        default=None,
+        help="Optional controller checkpoint used to measure replay-time controller entropy.",
+    )
     add_model_loading_args(parser)
     add_trace_boost_args(parser)
     args = parser.parse_args()
@@ -692,6 +826,10 @@ def main() -> None:
     effective_context_mode = "full_context" if args.trace_variant == "no_reasoning" else context_mode
 
     model = QwenLVAR(config["model"])
+    if args.controller_path:
+        loaded = load_controller_checkpoint(model, args.controller_path)
+        if not loaded:
+            raise FileNotFoundError(f"Controller checkpoint not found: {args.controller_path}")
     model.eval()
 
     output_path = Path(
@@ -867,6 +1005,7 @@ def main() -> None:
             "visual_dropout": False,
         },
         "checkpoint_path": config["model"].get("checkpoint_path"),
+        "controller_checkpoint_path": args.controller_path,
         "use_checkpoint": config["model"].get("use_checkpoint"),
         "trace_boost": model.trace_boost_config.to_dict(),
         "add_answer_instruction": bool(args.add_answer_instruction),

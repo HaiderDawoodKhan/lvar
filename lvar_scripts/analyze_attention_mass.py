@@ -178,6 +178,11 @@ def last_layer_attention_masses(
         outputs = model.backbone(
             inputs_embeds=decoded["final_inputs_embeds"],
             attention_mask=decoded["final_attention_mask"],
+            **(
+                {"position_ids": decoded["final_position_ids"]}
+                if model.use_mrope_position_ids and decoded.get("final_position_ids") is not None
+                else {}
+            ),
             output_attentions=True,
             return_dict=True,
             use_cache=False,
@@ -247,7 +252,11 @@ def main() -> None:
     dataset_cfg = config["dataset"]
     if "action_selection" in inference_cfg:
         model_cfg["action_selection"] = inference_cfg["action_selection"]
-    if bool(config.get("phase3", {}).get("phase3_v2", False)) or bool(config.get("phase3", {}).get("remove_global", False)):
+    phase3_cfg = config.get("phase3", {})
+    phase3_v2_cfg = config.get("phase3_v2", {})
+    phase3_v2_enabled = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
+    phase3_v2_removes_global = bool(phase3_v2_cfg.get("remove_global", phase3_cfg.get("remove_global", True)))
+    if phase3_v2_enabled and phase3_v2_removes_global:
         model_cfg["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in inference_cfg:
         model_cfg["mask_immediate_repeats"] = bool(inference_cfg["mask_immediate_repeats"])
