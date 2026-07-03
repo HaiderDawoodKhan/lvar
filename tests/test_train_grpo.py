@@ -16,6 +16,7 @@ from lvar_scripts.train_grpo import (
     build_constant_with_warmup_scheduler,
     compute_correctness_only_reward,
     compute_grpo_policy_loss,
+    iter_minibatches,
 )
 from test_model import build_model
 
@@ -129,6 +130,11 @@ class GRPOTrainingTests(unittest.TestCase):
         self.assertAlmostEqual(initial_lr, 1.5e-5)
         self.assertAlmostEqual(warmup_end_lr, 3e-5)
         self.assertAlmostEqual(constant_lr, 3e-5)
+
+    def test_iter_minibatches_splits_rollouts_by_requested_size(self):
+        minibatches = list(iter_minibatches(list(range(10)), 4))
+
+        self.assertEqual(minibatches, [(0, [0, 1, 2, 3]), (4, [4, 5, 6, 7]), (8, [8, 9])])
 
     def test_patch_sampling_masks_already_selected_patches(self):
         model = build_model(controller_context_window=1, max_steps=1)

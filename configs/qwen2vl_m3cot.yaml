@@ -142,7 +142,11 @@ phase5:
   use_baseline_advantage_weighting: false
   dataset_epochs: 4
   num_epochs: 4
+  prompt_batch_size: 8
   num_rollouts_per_prompt: 10
+  generation_prompt_microbatch_size: 1
+  trajectory_minibatch_size: 4
+  gradient_accumulation_steps: 10
   group_size: 10
   learning_rate: 0.00003
   controller_lr: 0.00003

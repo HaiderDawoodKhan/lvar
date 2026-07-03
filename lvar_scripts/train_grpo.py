@@ -3,6 +3,7 @@ import json
 import random
 import sys
 from pathlib import Path
+from math import ceil
 
 import torch
 import yaml
@@ -177,6 +178,13 @@ def compute_clipped_grpo_policy_loss(
     return clipped_grpo_loss(advantages, rollout_outputs, current_log_probs, clip_epsilon=clip_epsilon)
 
 
+def iter_minibatches(values: list, minibatch_size: int):
+    """Yield contiguous minibatches from a list."""
+    minibatch_size = max(1, int(minibatch_size))
+    for start in range(0, len(values), minibatch_size):
+        yield start, values[start : start + minibatch_size]
+
+
 def main() -> None:
     """Train Phase 5 controller refinement with clipped GRPO."""
     parser = argparse.ArgumentParser(description="Train Phase 5 GRPO controller refinement.")
@@ -287,6 +295,18 @@ def main() -> None:
     if checkpoint_every < 0:
         raise ValueError("phase5.checkpoint_every / --checkpoint-every must be >= 0.")
     group_size = int(train_cfg.get("num_rollouts_per_prompt", train_cfg.get("group_size", 6)))
+    prompt_batch_size = int(train_cfg.get("prompt_batch_size", 1))
+    generation_prompt_microbatch_size = int(train_cfg.get("generation_prompt_microbatch_size", 1))
+    trajectory_minibatch_size = int(train_cfg.get("trajectory_minibatch_size", group_size))
+    gradient_accumulation_steps = int(train_cfg.get("gradient_accumulation_steps", 1))
+    if prompt_batch_size <= 0:
+        raise ValueError("phase5.prompt_batch_size must be positive.")
+    if generation_prompt_microbatch_size <= 0:
+        raise ValueError("phase5.generation_prompt_microbatch_size must be positive.")
+    if trajectory_minibatch_size <= 0:
+        raise ValueError("phase5.trajectory_minibatch_size must be positive.")
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("phase5.gradient_accumulation_steps must be positive.")
     grad_clip_norm = float(train_cfg.get("max_grad_norm", train_cfg.get("grad_clip_norm", 1.0)))
     log_every = int(train_cfg.get("log_every", 10))
     max_controller_steps = int(train_cfg.get("max_controller_steps", train_cfg.get("controller_max_steps", 20)))
@@ -314,7 +334,9 @@ def main() -> None:
     lr_schedule = str(train_cfg.get("lr_schedule", "constant")).lower()
     if lr_schedule != "constant":
         raise ValueError("phase5.lr_schedule currently supports only 'constant'.")
-    total_update_steps = max(1, num_epochs * len(dataset) * update_epochs)
+    minibatches_per_prompt = max(1, ceil(group_size / trajectory_minibatch_size))
+    total_minibatches = max(1, num_epochs * len(dataset) * update_epochs * minibatches_per_prompt)
+    total_update_steps = max(1, ceil(total_minibatches / gradient_accumulation_steps))
     scheduler = build_constant_with_warmup_scheduler(
         optimizer,
         total_steps=total_update_steps,
@@ -327,10 +349,31 @@ def main() -> None:
     prompt_step = 0
     skipped_zero_advantage = 0
     skipped_no_loss = 0
+    prompts_in_batch = 0
+    accumulated_minibatches = 0
+    pending_optimizer_step = False
+    last_grad_norm = 0.0
+
+    optimizer.zero_grad(set_to_none=True)
+
+    def flush_optimizer_step() -> bool:
+        nonlocal accumulated_minibatches, global_step, last_grad_norm, pending_optimizer_step
+        if not pending_optimizer_step:
+            return False
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_norm)
+        last_grad_norm = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        global_step += 1
+        accumulated_minibatches = 0
+        pending_optimizer_step = False
+        return True
 
     for epoch in range(num_epochs):
         for example in dataset:
             prompt_step += 1
+            prompts_in_batch += 1
             # ------------------------------------------------------------
             # 1. Optionally compute no-latent baseline correctness once.
             # ------------------------------------------------------------
@@ -444,6 +487,10 @@ def main() -> None:
                 "dataset_partition": dataset_partition,
                 "reward_mode": reward_mode,
                 "num_rollouts": group_size,
+                "prompt_batch_size": prompt_batch_size,
+                "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
+                "trajectory_minibatch_size": trajectory_minibatch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
                 "correct_rollouts": correct_rollouts,
                 "incorrect_rollouts": group_size - correct_rollouts,
                 "rollout_accuracy": correct_rollouts / max(1, group_size),
@@ -469,9 +516,14 @@ def main() -> None:
                 base_log_row["skipped_zero_advantage_total"] = skipped_zero_advantage
                 if accelerator.is_local_main_process:
                     append_jsonl_row(metrics_path, base_log_row)
+                if prompts_in_batch >= prompt_batch_size:
+                    flush_optimizer_step()
+                    prompts_in_batch = 0
                 continue
 
             loss = None
+            loss_values = []
+            diagnostic_values = []
             last_diagnostics = {
                 "adv_mean": float(advantages.detach().float().mean().item()),
                 "adv_std": float(advantages.detach().float().std(unbiased=False).item()),
@@ -481,44 +533,42 @@ def main() -> None:
                 "grad_norm": 0.0,
             }
             for _ in range(update_epochs):
-                current_log_probs = [
-                    recompute_action_log_probs(
-                        model,
-                        example["image"],
-                        example["question"],
-                        rollout["actions"],
-                        temperature=rollout_temperature,
-                        image_size=image_size,
-                        min_controller_actions_before_stop=min_controller_actions_before_stop,
-                        min_visual_actions_before_stop=min_visual_actions_before_stop,
+                for start, rollout_minibatch in iter_minibatches(rollout_outputs, trajectory_minibatch_size):
+                    minibatch_advantages = advantages[start : start + len(rollout_minibatch)]
+                    current_log_probs = [
+                        recompute_action_log_probs(
+                            model,
+                            example["image"],
+                            example["question"],
+                            rollout["actions"],
+                            temperature=rollout_temperature,
+                            image_size=image_size,
+                            min_controller_actions_before_stop=min_controller_actions_before_stop,
+                            min_visual_actions_before_stop=min_visual_actions_before_stop,
+                        )
+                        for rollout in rollout_minibatch
+                    ]
+                    loss = compute_clipped_grpo_policy_loss(
+                        minibatch_advantages,
+                        rollout_minibatch,
+                        current_log_probs,
+                        clip_epsilon=clip_epsilon,
                     )
-                    for rollout in rollout_outputs
-                ]
-                loss = compute_clipped_grpo_policy_loss(
-                    advantages,
-                    rollout_outputs,
-                    current_log_probs,
-                    clip_epsilon=clip_epsilon,
-                )
-                if loss is None:
-                    continue
+                    if loss is None:
+                        continue
 
-                loss_value = float(loss.detach().item())
-                last_diagnostics = clipped_grpo_diagnostics(
-                    advantages,
-                    rollout_outputs,
-                    current_log_probs,
-                    clip_epsilon=clip_epsilon,
-                )
-
-                optimizer.zero_grad(set_to_none=True)
-                accelerator.backward(loss)
-
-                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_norm)
-                last_diagnostics["grad_norm"] = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
-
-                optimizer.step()
-                scheduler.step()
+                    loss_value = float(loss.detach().item())
+                    loss_values.append(loss_value)
+                    last_diagnostics = clipped_grpo_diagnostics(
+                        minibatch_advantages,
+                        rollout_minibatch,
+                        current_log_probs,
+                        clip_epsilon=clip_epsilon,
+                    )
+                    diagnostic_values.append(last_diagnostics)
+                    accelerator.backward(loss / float(gradient_accumulation_steps))
+                    accumulated_minibatches += 1
+                    pending_optimizer_step = True
 
             if loss is None:
                 skipped_no_loss += 1
@@ -526,22 +576,43 @@ def main() -> None:
                 base_log_row["skipped_no_loss_total"] = skipped_no_loss
                 if accelerator.is_local_main_process:
                     append_jsonl_row(metrics_path, base_log_row)
+                if prompts_in_batch >= prompt_batch_size:
+                    flush_optimizer_step()
+                    prompts_in_batch = 0
                 continue
+
+            optimizer_stepped = False
+            if accumulated_minibatches >= gradient_accumulation_steps or prompts_in_batch >= prompt_batch_size:
+                optimizer_stepped = flush_optimizer_step()
+                if prompts_in_batch >= prompt_batch_size:
+                    prompts_in_batch = 0
 
             del rollout_outputs, loss
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            global_step += 1
+            if diagnostic_values:
+                last_diagnostics = {
+                    "adv_mean": float(advantages.detach().float().mean().item()),
+                    "adv_std": float(advantages.detach().float().std(unbiased=False).item()),
+                    "adv_abs_mean": float(advantages.detach().float().abs().mean().item()),
+                    "mean_ratio": float(sum(item["mean_ratio"] for item in diagnostic_values) / len(diagnostic_values)),
+                    "clip_fraction": float(sum(item["clip_fraction"] for item in diagnostic_values) / len(diagnostic_values)),
+                    "grad_norm": last_grad_norm if optimizer_stepped else None,
+                }
+            loss_value = float(sum(loss_values) / max(1, len(loss_values)))
             update_log_row = {
                 **base_log_row,
-                "event": "update",
+                "event": "update" if optimizer_stepped else "accumulate",
                 "global_step": global_step,
                 "loss": loss_value,
                 "mean_ratio": last_diagnostics["mean_ratio"],
                 "clip_fraction": last_diagnostics["clip_fraction"],
                 "grad_norm": last_diagnostics["grad_norm"],
                 "learning_rate": scheduler.get_last_lr()[0],
+                "optimizer_stepped": optimizer_stepped,
+                "accumulated_minibatches": accumulated_minibatches,
+                "trajectory_minibatches": len(loss_values),
                 "skipped_zero_advantage_total": skipped_zero_advantage,
                 "skipped_no_loss_total": skipped_no_loss,
                 "metrics": metric_tracker.summary(),
@@ -549,7 +620,7 @@ def main() -> None:
             if accelerator.is_local_main_process:
                 append_jsonl_row(metrics_path, update_log_row)
 
-            if global_step % log_every == 0 and accelerator.is_local_main_process:
+            if optimizer_stepped and global_step % log_every == 0 and accelerator.is_local_main_process:
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"loss={loss_value:.4f} "
@@ -564,8 +635,14 @@ def main() -> None:
                     f"mean_ratio={last_diagnostics['mean_ratio']:.4f} "
                     f"clip_fraction={last_diagnostics['clip_fraction']:.4f} "
                     f"grad_norm={last_diagnostics['grad_norm']:.4f} "
+                    f"prompt_batch_size={prompt_batch_size} "
+                    f"trajectory_minibatch_size={trajectory_minibatch_size} "
+                    f"gradient_accumulation_steps={gradient_accumulation_steps} "
                     f"metrics={metric_tracker.summary()} "
                 )
+        if prompts_in_batch > 0:
+            flush_optimizer_step()
+            prompts_in_batch = 0
         should_checkpoint_epoch = checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0
         if should_checkpoint_epoch and accelerator.is_local_main_process:
             epoch_checkpoint_path = output_dir / f"phase5_controller_epoch_{epoch + 1}.pt"
@@ -586,6 +663,10 @@ def main() -> None:
                     "summary_path": str(summary_path),
                     "skipped_zero_advantage": skipped_zero_advantage,
                     "skipped_no_loss": skipped_no_loss,
+                    "prompt_batch_size": prompt_batch_size,
+                    "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
+                    "trajectory_minibatch_size": trajectory_minibatch_size,
+                    "gradient_accumulation_steps": gradient_accumulation_steps,
                 },
             )
 
@@ -608,6 +689,10 @@ def main() -> None:
                 "summary_path": str(summary_path),
                 "skipped_zero_advantage": skipped_zero_advantage,
                 "skipped_no_loss": skipped_no_loss,
+                "prompt_batch_size": prompt_batch_size,
+                "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
+                "trajectory_minibatch_size": trajectory_minibatch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
             },
         )
         write_json(
@@ -620,6 +705,10 @@ def main() -> None:
                 "num_prompts_seen": prompt_step,
                 "num_updates": global_step,
                 "num_rollouts_per_prompt": group_size,
+                "prompt_batch_size": prompt_batch_size,
+                "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
+                "trajectory_minibatch_size": trajectory_minibatch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
                 "temperature": rollout_temperature,
                 "learning_rate": learning_rate,
                 "optimizer": train_cfg.get("optimizer", "AdamW"),
