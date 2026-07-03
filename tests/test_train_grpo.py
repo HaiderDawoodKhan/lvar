@@ -11,7 +11,12 @@ from lvar.grpo_training import (
     target_logprob,
 )
 from lvar.utils import ACTION_PATCH, ACTION_REGION, ACTION_STOP
-from lvar_scripts.train_grpo import asymmetric_baseline_weight, compute_grpo_policy_loss
+from lvar_scripts.train_grpo import (
+    asymmetric_baseline_weight,
+    build_constant_with_warmup_scheduler,
+    compute_correctness_only_reward,
+    compute_grpo_policy_loss,
+)
 from test_model import build_model
 
 
@@ -86,6 +91,44 @@ class GRPOTrainingTests(unittest.TestCase):
         weighted = advantages * weights
 
         self.assertTrue(torch.allclose(weighted, advantages * torch.tensor([1.0, 2.0])))
+
+    def test_correctness_only_reward_discards_shaping_terms(self):
+        rollout = {
+            "actions": [{"type": "THINK"}, {"type": "PATCH", "patch_idx": 1}],
+            "selected_visual_actions": [{"type": "PATCH", "patch_idx": 1}],
+            "num_steps": 2,
+            "stopped": False,
+        }
+
+        reward = compute_correctness_only_reward(1.0, rollout)
+
+        self.assertEqual(reward["reward"], 1.0)
+        self.assertEqual(reward["r_correct"], 1.0)
+        self.assertEqual(reward["r_logp"], 0.0)
+        self.assertEqual(reward["r_cf"], 0.0)
+        self.assertEqual(reward["r_stop"], 0.0)
+        self.assertEqual(reward["r_visual"], 0.0)
+        self.assertEqual(reward["r_early_stop"], 0.0)
+        self.assertEqual(reward["r_think_once"], 0.0)
+        self.assertEqual(reward["think_count"], 1.0)
+        self.assertEqual(reward["visual_count"], 1.0)
+
+    def test_constant_scheduler_uses_linear_warmup_then_stays_constant(self):
+        parameter = torch.nn.Parameter(torch.ones(()))
+        optimizer = torch.optim.AdamW([parameter], lr=3e-5)
+        scheduler = build_constant_with_warmup_scheduler(optimizer, total_steps=4, warmup_ratio=0.5)
+
+        initial_lr = scheduler.get_last_lr()[0]
+        optimizer.step()
+        scheduler.step()
+        warmup_end_lr = scheduler.get_last_lr()[0]
+        optimizer.step()
+        scheduler.step()
+        constant_lr = scheduler.get_last_lr()[0]
+
+        self.assertAlmostEqual(initial_lr, 1.5e-5)
+        self.assertAlmostEqual(warmup_end_lr, 3e-5)
+        self.assertAlmostEqual(constant_lr, 3e-5)
 
     def test_patch_sampling_masks_already_selected_patches(self):
         model = build_model(controller_context_window=1, max_steps=1)

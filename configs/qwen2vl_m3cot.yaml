@@ -137,32 +137,44 @@ phase5:
   dataset_partition: validation
   phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
   controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
-  output_dir: outputs/grpo_phase5_m3cot
-  controller_lr: 0.00005
-  weight_decay: 0.0
-  num_epochs: 1
+  output_dir: outputs/grpo_phase5_m3cot_correctness_only
+  reward_mode: correctness_only
+  use_baseline_advantage_weighting: false
+  dataset_epochs: 4
+  num_epochs: 4
+  num_rollouts_per_prompt: 10
+  group_size: 10
+  learning_rate: 0.00003
+  controller_lr: 0.00003
+  optimizer: AdamW
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  lr_schedule: constant
   # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
   checkpoint_every: 1
   max_examples:
-  group_size: 6
   update_epochs: 1
+  max_grad_norm: 1.0
   grad_clip_norm: 1.0
   log_every: 1
   image_size: 280
   controller_max_steps: 32
   max_controller_steps: 32
+  temperature: 1.5
   rollout_temperature: 1.5
-  clip_epsilon: 0.2
-  logp_weight: 0.05
-  counterfactual_weight: 0.3
-  use_counterfactual_reward: true
+  ppo_clip_range: 0.30
+  clip_epsilon: 0.30
+  logp_weight: 0.0
+  counterfactual_weight: 0.0
+  use_counterfactual_reward: false
   cf_random_image_probability: 0.35
-  no_stop_penalty: 0.2
-  no_visual_penalty: 0.3
-  early_stop_penalty: 0.3
+  no_stop_penalty: 0.0
+  no_visual_penalty: 0.0
+  early_stop_penalty: 0.0
   min_controller_actions_before_stop: 3
   min_visual_actions_before_stop: 1
-  think_once_bonus: 0.1
+  think_once_bonus: 0.0
   advantage_epsilon: 0.000001
   improve_weight: 1.5
   miss_weight: 1.0
