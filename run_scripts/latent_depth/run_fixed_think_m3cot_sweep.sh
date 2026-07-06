@@ -9,7 +9,7 @@ Usage:
 Environment overrides:
   LVAR_CHECKPOINT_PATH        LVAR/M3CoT checkpoint path if not passed as arg 1
   IVTLR_CHECKPOINT_PATH       IVT-LR/M3CoT checkpoint path if not passed as arg 2
-  OUTPUT_ROOT                 Output root, default outputs/inference/fixed_think_sweep
+  OUTPUT_ROOT                 Output root, default outputs/inference/m3cot/fixed_think_sweep
   CONTEXT                     global, coarse, full_context, or global_mean; default global
   IMAGE_SIZE                  Image size passed to inference; default 280
   LIMIT                       Optional dataset limit for quick smoke runs
@@ -21,8 +21,8 @@ USAGE
   exit 1
 fi
 
-LVAR_CHECKPOINT_PATH="${1:-${LVAR_CHECKPOINT_PATH:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
-IVTLR_CHECKPOINT_PATH="${2:-${IVTLR_CHECKPOINT_PATH:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}}"
+LVAR_CHECKPOINT_PATH="${1:-${LVAR_CHECKPOINT_PATH:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+IVTLR_CHECKPOINT_PATH="${2:-${IVTLR_CHECKPOINT_PATH:-D:/Haider/IVTLR-Baseline/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}}"
 
 if [[ -z "${LVAR_CHECKPOINT_PATH}" ]]; then
   echo "Missing LVAR checkpoint path." >&2
@@ -33,7 +33,7 @@ if [[ -z "${IVTLR_CHECKPOINT_PATH}" ]]; then
   exit 1
 fi
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/fixed_think_sweep}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/m3cot/fixed_think_sweep}"
 CONTEXT="${CONTEXT:-global}"
 IMAGE_SIZE="${IMAGE_SIZE:-280}"
 TRACK_LATENT_DEPTH_METRICS="${TRACK_LATENT_DEPTH_METRICS:-1}"

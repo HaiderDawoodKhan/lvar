@@ -90,6 +90,28 @@ class DummyVision(torch.nn.Module):
         return self.image_tokens.clone()
 
 
+class DummyModelOutputVision(DummyVision):
+    def forward(self, pixel_values, grid_thw=None):
+        del pixel_values, grid_thw
+        return types.SimpleNamespace(
+            last_hidden_state=self.image_tokens.clone().unsqueeze(0),
+            pooler_output=self.image_tokens.mean(0, keepdim=True),
+        )
+
+
+class DummyPremergeModelOutputVision(DummyVision):
+    def __init__(self, spatial_merge_size=2):
+        super().__init__(spatial_merge_size=spatial_merge_size)
+        self.register_buffer("premerge_tokens", torch.arange(64, dtype=torch.float32).view(16, 4))
+
+    def forward(self, pixel_values, grid_thw=None):
+        del pixel_values, grid_thw
+        return types.SimpleNamespace(
+            pooler_output=self.premerge_tokens.mean(0, keepdim=True),
+            last_hidden_state=self.premerge_tokens.clone().unsqueeze(0),
+        )
+
+
 class DummyMergedGridProcessor(DummyProcessor):
     def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
         batch = super().apply_chat_template(messages, add_generation_prompt, tokenize)
@@ -152,6 +174,18 @@ class DummyNestedVisualBackbone(DummyBackbone):
         self.model.visual = visual
 
 
+class DummyModelOutputBackbone(DummyBackbone):
+    def __init__(self, spatial_merge_size=1):
+        super().__init__(spatial_merge_size=spatial_merge_size)
+        self.visual = DummyModelOutputVision(spatial_merge_size=spatial_merge_size)
+
+
+class DummyPremergeModelOutputBackbone(DummyBackbone):
+    def __init__(self, spatial_merge_size=2):
+        super().__init__(spatial_merge_size=spatial_merge_size)
+        self.visual = DummyPremergeModelOutputVision(spatial_merge_size=spatial_merge_size)
+
+
 def build_model(**overrides):
     cfg = {
         "device": "cpu",
@@ -196,6 +230,40 @@ def build_nested_visual_model():
     return QwenLVAR(
         cfg,
         backbone=DummyNestedVisualBackbone(spatial_merge_size=2),
+        processor=DummyMergedGridProcessor(),
+    )
+
+
+def build_model_output_visual_model():
+    cfg = {
+        "device": "cpu",
+        "dtype": "float32",
+        "max_steps": 3,
+        "region_window": 1,
+        "max_answer_tokens": 1,
+        "action_selection": "argmax",
+        "controller_context_window": 1,
+    }
+    return QwenLVAR(
+        cfg,
+        backbone=DummyModelOutputBackbone(),
+        processor=DummyProcessor(),
+    )
+
+
+def build_premerge_model_output_visual_model():
+    cfg = {
+        "device": "cpu",
+        "dtype": "float32",
+        "max_steps": 3,
+        "region_window": 1,
+        "max_answer_tokens": 1,
+        "action_selection": "argmax",
+        "controller_context_window": 1,
+    }
+    return QwenLVAR(
+        cfg,
+        backbone=DummyPremergeModelOutputBackbone(spatial_merge_size=2),
         processor=DummyMergedGridProcessor(),
     )
 
@@ -322,6 +390,28 @@ class QwenLVARTests(unittest.TestCase):
         bank = model.build_visual_bank(projected)
         self.assertEqual(tuple(model._current_postmerge_grid), (2, 2))
         self.assertEqual(tuple(bank["patches"].shape), (4, 4))
+
+    def test_projected_image_tokens_accept_model_output_visual_encoder(self):
+        model = build_model_output_visual_model()
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        bank = model.build_visual_bank(projected)
+        self.assertEqual(tuple(projected.shape), (4, 4))
+        self.assertEqual(tuple(bank["patches"].shape), (4, 4))
+        self.assertTrue(torch.allclose(projected, model.backbone.visual.image_tokens))
+
+    def test_projected_image_tokens_pool_premerge_model_output_grid(self):
+        model = build_premerge_model_output_visual_model()
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        bank = model.build_visual_bank(projected)
+        expected = model.backbone.visual.premerge_tokens.view(4, 4, 4)
+        expected = expected.view(2, 2, 2, 2, 4).mean(dim=(1, 3)).reshape(4, 4)
+        self.assertEqual(tuple(model._current_premerge_grid), (4, 4))
+        self.assertEqual(tuple(model._current_postmerge_grid), (2, 2))
+        self.assertEqual(tuple(projected.shape), (4, 4))
+        self.assertEqual(tuple(bank["patches"].shape), (4, 4))
+        self.assertTrue(torch.allclose(projected, expected))
 
     def test_build_visual_bank_pads_non_divisible_grid(self):
         model = build_model()

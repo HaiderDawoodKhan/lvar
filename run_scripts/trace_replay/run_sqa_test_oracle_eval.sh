@@ -2,9 +2,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
-IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
-LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+CONFIG="${CONFIG:-configs/qwen2vl_sqa.yaml}"
+IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-D:/Haider/IVTLR-Baseline/qwen_vl/output/qwen_IVTLR_sqa/epoch_16_full_model_fp32.pth}"
+LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-D:/Haider/IVTLR-Baseline/qwen_vl/lvar_sqa_phase_1/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
 GLOBAL_REPLAY_CONTEXT="${GLOBAL_REPLAY_CONTEXT:-global}"
@@ -40,19 +40,19 @@ eval_mined_traces() {
   local replay_suffix=""
   if [[ "${replay_context_label}" != "${context_label}" ]]; then replay_suffix="_replayed-under_${replay_context_label}"; fi
 
-  local trace_path="outputs/oracle_dataset/validation/${mined_by_key}_ckpt/m3cot_validation_traces_${mined_by_key}_${context_label}.jsonl"
+  local trace_path="outputs/oracle_dataset/sqa/test/${mined_by_key}_ckpt/sqa_test_traces_${mined_by_key}_${context_label}.jsonl"
   local variants=("raw" "filtered_cap" "filtered_no_cap")
 
   for trace_variant in "${variants[@]}"; do
-    local inference_dir="outputs/inference/validation_oracle/mined_by_${mined_by_key}_ckpt/evaluated_by_${evaluated_by_key}_ckpt/trace_variant_${trace_variant}"
-    local output_path="${inference_dir}/m3cot_validation_predictions_mined-by_${mined_by_key}_evaluated-by_${evaluated_by_key}_${context_label}_${trace_variant}${replay_suffix}.jsonl"
+    local inference_dir="outputs/inference/sqa/test_oracle/mined_by_${mined_by_key}_ckpt/evaluated_by_${evaluated_by_key}_ckpt/trace_variant_${trace_variant}"
+    local output_path="${inference_dir}/sqa_test_predictions_mined-by_${mined_by_key}_evaluated-by_${evaluated_by_key}_${context_label}_${trace_variant}${replay_suffix}.jsonl"
 
     mkdir -p "${inference_dir}"
 
     echo "Evaluating ${context_label} ${trace_variant} traces mined by ${mined_by_key} checkpoint using ${evaluated_by_key} checkpoint with entropy tracking..."
     python lvar_scripts/eval_mined_traces_m3cot.py \
       --config "${CONFIG}" \
-      --dataset-partition validation \
+      --dataset-partition test \
       --checkpoint-path "${evaluator_checkpoint_path}" \
       --context "${replay_context_label}" \
       --trace-variant "${trace_variant}" \
@@ -63,10 +63,6 @@ eval_mined_traces() {
   done
 }
 
-
 eval_mined_traces "lvar" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global"
-eval_mined_traces "lvar" "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse"
-
-
+echo "Running cross-checkpoint oracle-forced evals..."
 eval_mined_traces "lvar" "ivtlr" "${IVTLR_CHECKPOINT}" "global"
-eval_mined_traces "lvar" "ivtlr" "${IVTLR_CHECKPOINT}" "coarse"

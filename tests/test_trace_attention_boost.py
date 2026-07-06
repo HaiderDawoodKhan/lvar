@@ -131,17 +131,17 @@ class TraceAttentionBoostTests(unittest.TestCase):
     def test_known_output_directories_are_rewritten_once(self):
         self.assertEqual(
             boosted_output_path(
-                "outputs/inference/current_lvar_model/predictions.jsonl",
+                "outputs/inference/m3cot/current_lvar_model/predictions.jsonl",
                 enabled=True,
             ),
-            "outputs/inference/current_lvar_model_boosted/predictions.jsonl",
+            "outputs/inference/m3cot/m3cot/current_lvar_model_boosted/predictions.jsonl",
         )
         self.assertEqual(
             boosted_output_path(
-                "outputs/inference/test_oracle_boosted/predictions.jsonl",
+                "outputs/inference/m3cot/test_oracle_boosted/predictions.jsonl",
                 enabled=True,
             ),
-            "outputs/inference/test_oracle_boosted/predictions.jsonl",
+            "outputs/inference/m3cot/test_oracle_boosted/predictions.jsonl",
         )
         self.assertEqual(
             boosted_output_path("outputs/custom/predictions.jsonl", enabled=True),

@@ -3,9 +3,9 @@ set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
 DATASET_PARTITION="${DATASET_PARTITION:-validation}"
-LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
-CONTROLLER_CHECKPOINT="${CONTROLLER_CHECKPOINT:-/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot_test_sweeps/train/global_test/multihot_binary/controller_sft.pt}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/${DATASET_PARTITION}_num_rollouts_ablation}"
+LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+CONTROLLER_CHECKPOINT="${CONTROLLER_CHECKPOINT:-D:/Haider/lvar/outputs/controller_sft_m3cot_test_sweeps/train/global_test/multihot_binary/controller_sft.pt}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/m3cot/${DATASET_PARTITION}_num_rollouts_ablation}"
 ROLLOUT_VALUES="${ROLLOUT_VALUES:-1 2 4 8 16 32}"
 TEMPERATURE="${TEMPERATURE:-1.5}"
 SEED="${SEED:-42}"

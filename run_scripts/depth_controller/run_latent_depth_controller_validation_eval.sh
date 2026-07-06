@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
-SWEEP_OUTPUT_ROOT="${SWEEP_OUTPUT_ROOT:-outputs/inference/fixed_think_sweep}"
+SWEEP_OUTPUT_ROOT="${SWEEP_OUTPUT_ROOT:-outputs/inference/m3cot/fixed_think_sweep}"
 EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-outputs/latent_depth_controller_m3cot/eval}"
 DATASET_PARTITION="${DATASET_PARTITION:-test}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-lvar}"

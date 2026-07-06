@@ -2,8 +2,8 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
-IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
-LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-D:/Haider/IVTLR-Baseline/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
+LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
 GLOBAL_REPLAY_CONTEXT="${GLOBAL_REPLAY_CONTEXT:-global}"
@@ -38,7 +38,7 @@ eval_visual_index_modes() {
   fi
 
   for visual_index_mode in "${visual_index_modes[@]}"; do
-    local inference_dir="outputs/inference/test_oracle_visual_index/mined_by_${model_key}_ckpt/evaluated_by_${model_key}_ckpt/context_${context_label}/visual_index_mode_${visual_index_mode}"
+    local inference_dir="outputs/inference/m3cot/test_oracle_visual_index/mined_by_${model_key}_ckpt/evaluated_by_${model_key}_ckpt/context_${context_label}/visual_index_mode_${visual_index_mode}"
     local output_path="${inference_dir}/m3cot_test_predictions_mined-by_${model_key}_evaluated-by_${model_key}_${context_label}_raw_${visual_index_mode}${replay_suffix}.jsonl"
 
     mkdir -p "${inference_dir}"
@@ -63,4 +63,4 @@ eval_visual_index_modes "ivtlr" "${IVTLR_CHECKPOINT}" "coarse"
 eval_visual_index_modes "lvar" "${LVAR_PHASE1_CHECKPOINT}" "global"
 eval_visual_index_modes "lvar" "${LVAR_PHASE1_CHECKPOINT}" "coarse"
 
-echo "Done. Wrote eight runs under outputs/inference/test_oracle_visual_index."
+echo "Done. Wrote eight runs under outputs/inference/m3cot/test_oracle_visual_index."

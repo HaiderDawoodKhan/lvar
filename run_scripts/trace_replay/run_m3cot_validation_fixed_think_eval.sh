@@ -6,7 +6,7 @@ DATASET_PARTITION="${DATASET_PARTITION:-validation}"
 THINK_STEPS="${THINK_STEPS:-2}"
 CONTEXT="${CONTEXT:-global}"
 IMAGE_SIZE="${IMAGE_SIZE:-280}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/${DATASET_PARTITION}_fixed_think}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/m3cot/${DATASET_PARTITION}_fixed_think}"
 
 run_dir="${OUTPUT_ROOT}/evaluated_by_lvar_ckpt/fixed_think_steps_${THINK_STEPS}"
 mkdir -p "${run_dir}"

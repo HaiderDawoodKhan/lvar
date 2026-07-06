@@ -3,8 +3,8 @@ set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
 DATASET_PARTITION="${DATASET_PARTITION:-test}"
-LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/${DATASET_PARTITION}_oracle_ablations}"
+LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/m3cot/${DATASET_PARTITION}_oracle_ablations}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
 STEP_ENTROPY_TOP_K="${STEP_ENTROPY_TOP_K:-}"

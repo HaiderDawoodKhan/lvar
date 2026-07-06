@@ -9,7 +9,7 @@ Usage:
 Environment overrides:
   M3COT_CHECKPOINT_PATH       M3CoT checkpoint path if not passed as arg 1
   SQA_CHECKPOINT_PATH         ScienceQA checkpoint path if not passed as arg 2
-  OUTPUT_ROOT                 Output root, default outputs/inference/fixed_think_sweep
+  OUTPUT_ROOT                 Output root, default outputs/inference/m3cot/fixed_think_sweep
   CONTEXT                     global, coarse, full_context, or global_mean; default global
   IMAGE_SIZE                  Image size passed to inference; default 280
   LIMIT                       Optional dataset limit for quick smoke runs
@@ -19,8 +19,8 @@ USAGE
   exit 1
 fi
 
-M3COT_CHECKPOINT_PATH="${1:-${M3COT_CHECKPOINT_PATH:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
-SQA_CHECKPOINT_PATH="${2:-${SQA_CHECKPOINT_PATH:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/lvar_sqa_phase_1/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+M3COT_CHECKPOINT_PATH="${1:-${M3COT_CHECKPOINT_PATH:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+SQA_CHECKPOINT_PATH="${2:-${SQA_CHECKPOINT_PATH:-D:/Haider/IVTLR-Baseline/qwen_vl/lvar_sqa_phase_1/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
 
 if [[ -z "${M3COT_CHECKPOINT_PATH}" ]]; then
   echo "Missing M3CoT checkpoint path." >&2
@@ -31,7 +31,7 @@ if [[ -z "${SQA_CHECKPOINT_PATH}" ]]; then
   exit 1
 fi
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/fixed_think_sweep}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/inference/m3cot/fixed_think_sweep}"
 CONTEXT="${CONTEXT:-global}"
 IMAGE_SIZE="${IMAGE_SIZE:-280}"
 PARTITIONS=(test validation)

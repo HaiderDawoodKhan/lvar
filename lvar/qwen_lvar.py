@@ -409,6 +409,78 @@ class QwenLVAR(nn.Module):
                 return int(getattr(owner, "spatial_merge_size", 1))
         return 1
 
+    def _visual_token_count(self, tensor: torch.Tensor) -> Optional[int]:
+        if tensor.dim() == 2:
+            return int(tensor.size(0))
+        if tensor.dim() == 3:
+            return int(tensor.size(1))
+        return None
+
+    def _iter_visual_tensors(self, visual_output: Any) -> List[torch.Tensor]:
+        tensors: List[torch.Tensor] = []
+
+        def add_value(value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                tensors.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, torch.Tensor):
+                        tensors.append(item)
+
+        if isinstance(visual_output, torch.Tensor):
+            return [visual_output]
+
+        for key in ("pooler_output", "last_hidden_state", "hidden_states"):
+            if isinstance(visual_output, dict):
+                add_value(visual_output.get(key))
+            elif hasattr(visual_output, key):
+                add_value(getattr(visual_output, key))
+
+        if isinstance(visual_output, (list, tuple)):
+            add_value(visual_output)
+
+        return tensors
+
+    def _extract_visual_tensor(
+        self,
+        visual_output: Any,
+        expected_tokens: Optional[int] = None,
+        fallback_tokens: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Normalize visual encoder outputs across Transformers versions."""
+        tensors = self._iter_visual_tensors(visual_output)
+        if expected_tokens is not None:
+            for tensor in tensors:
+                if self._visual_token_count(tensor) == int(expected_tokens):
+                    return tensor
+        if fallback_tokens is not None:
+            for tensor in tensors:
+                if self._visual_token_count(tensor) == int(fallback_tokens):
+                    return tensor
+        if tensors:
+            return tensors[0]
+
+        raise TypeError(
+            "Visual encoder returned an unsupported output type. Expected a tensor, "
+            "a tuple/list containing a tensor, or a model output with last_hidden_state."
+        )
+
+    def _pool_premerge_visual_tokens(self, image_tokens: torch.Tensor) -> torch.Tensor:
+        if self._current_premerge_grid is None or self._current_postmerge_grid is None:
+            return image_tokens
+        pre_h, pre_w = self._current_premerge_grid
+        post_h, post_w = self._current_postmerge_grid
+        expected_pre = pre_h * pre_w
+        expected_post = post_h * post_w
+        if image_tokens.size(0) != expected_pre or image_tokens.size(0) == expected_post:
+            return image_tokens
+
+        merge_h = pre_h // post_h
+        merge_w = pre_w // post_w
+        patch_grid = image_tokens.view(pre_h, pre_w, image_tokens.size(-1))
+        merged = patch_grid.view(post_h, merge_h, post_w, merge_w, image_tokens.size(-1)).mean(dim=(1, 3))
+        return merged.reshape(expected_post, image_tokens.size(-1))
+
     def _maybe_resize_token_embeddings(self) -> None:
         """Resize embeddings after special tokens are attached to the processor tokenizer."""
         tokenizer = getattr(self.processor, "tokenizer", None)
@@ -1217,13 +1289,12 @@ class QwenLVAR(nn.Module):
         """
         if "projected_image_tokens" in batch:
             return batch["projected_image_tokens"]
-        
-        
+
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         if pixel_values is None:
             raise ValueError("pixel_values are required to extract projected image tokens.")
-        
+
         if image_grid_thw is not None:
             pre_grid, post_grid = self._resolve_image_grids(image_grid_thw)
             self._current_premerge_grid = pre_grid
@@ -1233,7 +1304,7 @@ class QwenLVAR(nn.Module):
             self._current_premerge_grid = None
             self._current_postmerge_grid = None
             self._current_image_grid = None
-            
+
         visual = self._resolve_visual_encoder(required=True)
         # Support minor signature differences across backbone/test doubles.
         try:
@@ -1243,9 +1314,21 @@ class QwenLVAR(nn.Module):
                 image_tokens = visual(pixel_values, image_grid_thw)
             except TypeError:
                 image_tokens = visual(pixel_values)
+        expected = None
+        fallback = None
+        if self._current_postmerge_grid is not None:
+            expected = self._current_postmerge_grid[0] * self._current_postmerge_grid[1]
+        if self._current_premerge_grid is not None:
+            fallback = self._current_premerge_grid[0] * self._current_premerge_grid[1]
+        image_tokens = self._extract_visual_tensor(
+            image_tokens,
+            expected_tokens=expected,
+            fallback_tokens=fallback,
+        )
         if image_tokens.dim() == 3:
             image_tokens = image_tokens[0]
-            
+        image_tokens = self._pool_premerge_visual_tokens(image_tokens)
+
         if self._current_postmerge_grid is not None:
             expected = self._current_postmerge_grid[0] * self._current_postmerge_grid[1]
             if image_tokens.size(0) != expected:

@@ -26,9 +26,9 @@ model:
     apply_stage: answer_only
   controller_context_window: 3
   use_checkpoint: true
-  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  checkpoint_path: "D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
   use_mrope_position_ids: false
-  # "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
+  # "D:/Haider/IVTLR-Baseline/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth"
 
 dataset:
   type: m3cot
@@ -53,7 +53,7 @@ phase3:
   seed: 42
   trace_path: outputs/phase2_m3cot_traces.jsonl
   output_dir: outputs/controller_sft_m3cot
-  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  phase4_vlm_checkpoint_path: "D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
   controller_lr: 0.0001
   learning_rate: 0.0005
   weight_decay: 0.0
@@ -135,8 +135,8 @@ phase4:
 phase5:
   seed: 42
   dataset_partition: validation
-  phase4_vlm_checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
-  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
+  phase4_vlm_checkpoint_path: "D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
+  controller_checkpoint_path: "D:/Haider/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   output_dir: outputs/grpo_phase5_m3cot_correctness_only
   reward_mode: correctness_only
   use_baseline_advantage_weighting: false
@@ -206,7 +206,7 @@ inference:
   # Leave null to compute full-vocabulary next-token entropy.
   step_entropy_top_k:
   track_prefix_rollouts: false
-  controller_checkpoint_path: "/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
+  controller_checkpoint_path: "D:/Haider/lvar/outputs/controller_sft_m3cot/controller_sft.pt"
   action_selection: argmax
   mask_immediate_repeats: false
 

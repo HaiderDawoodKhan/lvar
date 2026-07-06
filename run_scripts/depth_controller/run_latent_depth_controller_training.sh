@@ -9,7 +9,7 @@ Common usage:
 
 Environment overrides:
   CONFIG                  Config path, default configs/qwen2vl_m3cot.yaml
-  SWEEP_OUTPUT_ROOT       Fixed-THINK sweep root, default outputs/inference/fixed_think_sweep
+  SWEEP_OUTPUT_ROOT       Fixed-THINK sweep root, default outputs/inference/m3cot/fixed_think_sweep
   TRAIN_OUTPUT_ROOT       Output root, default outputs/latent_depth_controller_m3cot
   DATASET_PARTITION       Dataset partition to train from, default test
   CHECKPOINT_NAME         Sweep checkpoint folder to consume, default lvar
@@ -31,7 +31,7 @@ Environment overrides:
 USAGE
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
-SWEEP_OUTPUT_ROOT="${SWEEP_OUTPUT_ROOT:-outputs/inference/fixed_think_sweep}"
+SWEEP_OUTPUT_ROOT="${SWEEP_OUTPUT_ROOT:-outputs/inference/m3cot/fixed_think_sweep}"
 TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/latent_depth_controller_m3cot}"
 DATASET_PARTITION="${DATASET_PARTITION:-test}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-lvar}"

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_m3cot.yaml}"
-IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
-LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
-PHASE4_VLM_CHECKPOINT="${PHASE4_VLM_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
-CONTROLLER_CHECKPOINT="${CONTROLLER_CHECKPOINT:-/home/csalt/Haider/DVLM/lvar/outputs/controller_sft_m3cot/controller_sft.pt}"
+IVTLR_CHECKPOINT="${IVTLR_CHECKPOINT:-D:/Haider/IVTLR-Baseline/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
+LVAR_PHASE1_CHECKPOINT="${LVAR_PHASE1_CHECKPOINT:-${1:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}}"
+PHASE4_VLM_CHECKPOINT="${PHASE4_VLM_CHECKPOINT:-D:/Haider/IVTLR-Baseline/qwen_vl/output/qwen_IVTLR_m3cot/epoch_16_full_model_fp32.pth}"
+CONTROLLER_CHECKPOINT="${CONTROLLER_CHECKPOINT:-D:/Haider/lvar/outputs/controller_sft_m3cot/controller_sft.pt}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
 GLOBAL_REPLAY_CONTEXT="${GLOBAL_REPLAY_CONTEXT:-global}"
@@ -52,7 +52,7 @@ run_full_lvar() {
   local target="$1"
   local layer_mode="$2"
   local alpha="$3"
-  local inference_dir="outputs/inference/current_lvar_model_boosted/target_${target}/layers_${layer_mode}/alpha_${alpha}"
+  local inference_dir="outputs/inference/m3cot/m3cot/current_lvar_model_boosted/target_${target}/layers_${layer_mode}/alpha_${alpha}"
   local output_path="${inference_dir}/m3cot_lvar_predictions.jsonl"
 
   mkdir -p "${inference_dir}"
@@ -83,7 +83,7 @@ eval_mined_trace_setting() {
   if [[ "${replay_context_label}" != "${context_label}" ]]; then replay_suffix="_replayed-under_${replay_context_label}"; fi
 
   local trace_path="outputs/oracle_dataset/test/${mined_by_key}_ckpt/m3cot_test_traces_${mined_by_key}_${context_label}.jsonl"
-  local inference_dir="outputs/inference/test_oracle_boosted/mined_by_${mined_by_key}_ckpt/evaluated_by_${evaluated_by_key}_ckpt/trace_variant_raw/target_${target}/layers_${layer_mode}/alpha_${alpha}"
+  local inference_dir="outputs/inference/m3cot/test_oracle_boosted/mined_by_${mined_by_key}_ckpt/evaluated_by_${evaluated_by_key}_ckpt/trace_variant_raw/target_${target}/layers_${layer_mode}/alpha_${alpha}"
   local output_path="${inference_dir}/m3cot_test_predictions_mined-by_${mined_by_key}_evaluated-by_${evaluated_by_key}_${context_label}_raw${replay_suffix}.jsonl"
 
   if [[ ! -f "${trace_path}" ]]; then
@@ -120,5 +120,5 @@ while read -r target layer_mode alpha; do
   run_full_lvar "${target}" "${layer_mode}" "${alpha}"
 done < <(boost_settings)
 
-echo "Done. Full-pipeline outputs are under outputs/inference/current_lvar_model_boosted."
-echo "Raw oracle outputs are under outputs/inference/test_oracle_boosted."
+echo "Done. Full-pipeline outputs are under outputs/inference/m3cot/current_lvar_model_boosted."
+echo "Raw oracle outputs are under outputs/inference/m3cot/test_oracle_boosted."

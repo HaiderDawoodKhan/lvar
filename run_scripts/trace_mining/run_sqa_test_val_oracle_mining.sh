@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/qwen2vl_sqa.yaml}"
-SQA_CHECKPOINT="${SQA_CHECKPOINT:-/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}"
+SQA_CHECKPOINT="${SQA_CHECKPOINT:-D:/Haider/IVTLR-Baseline/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_sqa_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth}"
 LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
 TRACE_DIR_TEST="${TRACE_DIR_TEST:-${TRACE_DIR:-outputs/oracle_dataset/test/sqa_ckpt}}"
