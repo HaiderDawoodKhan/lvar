@@ -9,6 +9,8 @@ from lvar_scripts.eval_mined_traces_m3cot import (
     build_replay_trace,
     flatten_replay_blocks,
     next_token_entropy_from_state,
+    required_controller_max_steps_for_traces,
+    resolve_replay_controller_max_steps,
     rewrite_visual_action_index,
 )
 
@@ -98,6 +100,25 @@ class ReplayTraceVariantTests(unittest.TestCase):
         self.assertEqual([action["type"] for action in trace], ["THINK", "THINK", "STOP"])
         self.assertEqual(metrics["removed_visual_actions"], 4)
 
+    def test_no_think_keeps_visual_blocks_and_terminal_stop(self):
+        trace, metrics = self.build("no_think")
+
+        self.assertEqual(
+            [action["type"] for action in trace],
+            ["PATCH", "PATCH", "REGION", "GLOBAL", "STOP"],
+        )
+        self.assertEqual(metrics["removed_think_actions"], 2)
+        blocks = build_replay_blocks(
+            self.row,
+            replay_trace=trace,
+            trace_variant="no_think",
+            rng=random.Random(7),
+        )
+        patch_blocks = [block for block in blocks if block["label"] == "PATCH_SEQ"]
+        self.assertEqual(len(patch_blocks), 1)
+        self.assertEqual(len(patch_blocks[0]["actions"]), 2)
+        self.assertEqual(blocks[-1]["label"], "STOP")
+
     def test_no_reasoning_has_an_empty_replay_trace(self):
         trace, metrics = self.build("no_reasoning")
 
@@ -118,6 +139,65 @@ class ReplayTraceVariantTests(unittest.TestCase):
         patch_blocks = [block for block in blocks if block["label"] == "PATCH_SEQ"]
         self.assertEqual(len(patch_blocks), 1)
         self.assertEqual(len(patch_blocks[0]["actions"]), 2)
+
+    def test_required_controller_max_steps_matches_variant_lengths(self):
+        long_row = {
+            "example_id": "long",
+            "trace": [{"type": "THINK"} for _ in range(35)] + [{"type": "STOP"}],
+            "decisions": [
+                {"selected": "THINK", "actions": [{"type": "THINK"}], "improvement": 1.0}
+                for _ in range(35)
+            ],
+        }
+        short_row = {"example_id": "short", "trace": [{"type": "THINK"}, {"type": "STOP"}], "decisions": []}
+
+        raw_steps = required_controller_max_steps_for_traces(
+            [long_row, short_row],
+            trace_variant="raw",
+            visual_or_region_min_improvement=0.0,
+            think_min_improvement=0.0,
+            max_decision_blocks_per_example=6,
+            max_primitive_actions_per_example=8,
+            seed=42,
+        )
+        capped_steps = required_controller_max_steps_for_traces(
+            [long_row, short_row],
+            trace_variant="filtered_cap",
+            visual_or_region_min_improvement=0.0,
+            think_min_improvement=0.0,
+            max_decision_blocks_per_example=99,
+            max_primitive_actions_per_example=8,
+            seed=42,
+        )
+        limited_steps = required_controller_max_steps_for_traces(
+            [long_row, short_row],
+            trace_variant="raw",
+            visual_or_region_min_improvement=0.0,
+            think_min_improvement=0.0,
+            max_decision_blocks_per_example=6,
+            max_primitive_actions_per_example=8,
+            seed=42,
+            example_ids={"short"},
+        )
+        no_think_steps = required_controller_max_steps_for_traces(
+            [long_row, short_row],
+            trace_variant="no_think",
+            visual_or_region_min_improvement=0.0,
+            think_min_improvement=0.0,
+            max_decision_blocks_per_example=6,
+            max_primitive_actions_per_example=8,
+            seed=42,
+        )
+
+        self.assertEqual(raw_steps, 36)
+        self.assertEqual(capped_steps, 9)
+        self.assertEqual(limited_steps, 2)
+        self.assertEqual(no_think_steps, 1)
+
+    def test_replay_capacity_respects_controller_checkpoint_shape(self):
+        self.assertEqual(resolve_replay_controller_max_steps(32, 30, checkpoint_steps=40), 40)
+        with self.assertRaisesRegex(ValueError, "checkpoint contains only 32"):
+            resolve_replay_controller_max_steps(32, 33, checkpoint_steps=32)
 
 
 class StepEntropyTests(unittest.TestCase):

@@ -148,6 +148,42 @@ class ControllerSFTTests(unittest.TestCase):
         self.assertEqual(metrics["multi_hot_patch_indices"], 3)
         self.assertEqual(metrics["num_primitive_targets"], 5)
 
+    def test_replay_uses_sequential_cross_entropy_for_three_patches(self):
+        model = TinyReplayModel()
+        mined_row = {
+            "example_id": "ex-1",
+            "decisions": [
+                {
+                    "selected": "PATCH_SEQ_THINK",
+                    "actions": [
+                        {"type": "PATCH", "patch_idx": 0},
+                        {"type": "PATCH", "patch_idx": 2},
+                        {"type": "PATCH", "patch_idx": 3},
+                        {"type": "THINK"},
+                    ],
+                }
+            ],
+        }
+        source_example = {"id": "ex-1", "image": "image", "question": "question"}
+
+        loss, metrics = replay_controller_sft_loss(
+            model,
+            mined_row,
+            source_example,
+            use_one_replay_setting=True,
+            replay_setting="global",
+            decision_block_normalized=False,
+            multi_hot_patch_labels=False,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(model.seen_steps, [0, 1, 2, 3, 4])
+        self.assertEqual(model.applied_actions, ["PATCH", "PATCH", "PATCH", "THINK"])
+        self.assertEqual(metrics["action_counts"], {"PATCH": 3, "THINK": 1, "STOP": 1})
+        self.assertEqual(metrics["multi_hot_patch_blocks"], 0)
+        self.assertEqual(metrics["multi_hot_patch_indices"], 0)
+        self.assertEqual(metrics["num_primitive_targets"], 5)
+
     def test_single_replay_setting_forces_initial_context_mode(self):
         mined_row = {
             "example_id": "ex-1",

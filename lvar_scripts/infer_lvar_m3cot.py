@@ -105,6 +105,18 @@ def build_entropy_tracking_row(example, output, is_correct: bool):
     }
 
 
+def apply_max_controller_steps_override(model_cfg: dict, max_controller_steps: int | None) -> dict:
+    """Override both rollout length and step-embedding capacity for one inference run."""
+    updated = dict(model_cfg)
+    if max_controller_steps is None:
+        return updated
+    if max_controller_steps <= 0:
+        raise ValueError("--max-controller-steps must be greater than 0.")
+    updated["max_steps"] = int(max_controller_steps)
+    updated["controller_max_steps"] = int(max_controller_steps)
+    return updated
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run LVAR inference on the M3CoT test split with controller traces."
@@ -125,12 +137,19 @@ def main() -> None:
     parser.add_argument("--nucleus-insertion-top-p", type=float, default=None)
     parser.add_argument("--nucleus-insertion-max-indices", type=int, default=None)
     parser.add_argument("--use-validation-set", action="store_true", help="Use validation set for inference")
+    parser.add_argument(
+        "--max-controller-steps",
+        type=int,
+        default=None,
+        help="Override both controller rollout length and step-embedding capacity.",
+    )
     add_model_loading_args(parser)
     add_trace_boost_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
+    config["model"] = apply_max_controller_steps_override(config["model"], args.max_controller_steps)
     config["model"] = apply_trace_boost_overrides(config["model"], args)
     dataset_cfg = config["dataset"]
     inference_cfg = config.get("inference", {})

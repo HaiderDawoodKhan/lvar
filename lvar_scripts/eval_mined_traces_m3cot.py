@@ -4,7 +4,7 @@ import random
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 import yaml
@@ -256,6 +256,17 @@ def transform_replay_blocks(
             if actions:
                 transformed.append({"label": block["label"], "actions": actions})
         return transformed
+    if trace_variant == "no_think":
+        transformed = []
+        for block in copied:
+            actions = [
+                action
+                for action in block["actions"]
+                if str(action.get("type", "")).upper() != "THINK"
+            ]
+            if actions:
+                transformed.append({"label": block["label"], "actions": actions})
+        return transformed
     if trace_variant == "shuffled":
         terminal = [block for block in copied if any(str(a.get("type", "")).upper() == "STOP" for a in block["actions"])]
         nonterminal = [block for block in copied if block not in terminal]
@@ -350,7 +361,7 @@ def build_replay_trace(
     max_primitive_actions_per_example: int,
     rng: Any = random,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    if trace_variant in {"raw", "no_visual", "no_reasoning", "shuffled"}:
+    if trace_variant in {"raw", "no_think", "no_visual", "no_reasoning", "shuffled"}:
         source_blocks = raw_replay_blocks(trace_row)
         blocks = transform_replay_blocks(source_blocks, trace_variant=trace_variant, rng=rng)
         trace = flatten_replay_blocks(blocks)
@@ -366,12 +377,18 @@ def build_replay_trace(
             "cap_applied": False,
             "converted_noop_to_stop": 0,
             "removed_visual_actions": len(source_trace) - len(trace) if trace_variant == "no_visual" else 0,
+            "removed_think_actions": (
+                sum(str(action.get("type", "")).upper() == "THINK" for action in source_trace)
+                if trace_variant == "no_think"
+                else 0
+            ),
             "removed_global": trace_variant == "no_visual" and any(
                 str(action.get("type", "")).upper() == "GLOBAL" for action in source_trace
             ),
             "visual_dropout_applied": False,
             "shuffled": trace_variant == "shuffled",
             "no_reasoning": trace_variant == "no_reasoning",
+            "no_think": trace_variant == "no_think",
         }
 
     apply_cap = trace_variant == "filtered_cap"
@@ -394,12 +411,71 @@ def build_replay_blocks(
     rng: Any = random,
 ) -> List[Dict[str, Any]]:
     """Build decision-level blocks for replay and optional per-prefix measurements."""
-    if trace_variant in {"raw", "no_visual", "no_reasoning", "shuffled"}:
+    if trace_variant in {"raw", "no_think", "no_visual", "no_reasoning", "shuffled"}:
         return transform_replay_blocks(raw_replay_blocks(trace_row), trace_variant=trace_variant, rng=rng)
     return [
         {"label": str(action.get("type", "")).upper(), "actions": [dict(action)]}
         for action in replay_trace
     ]
+
+
+def required_controller_max_steps_for_traces(
+    trace_rows: Iterable[Dict[str, Any]],
+    trace_variant: str,
+    visual_or_region_min_improvement: float,
+    think_min_improvement: float,
+    max_decision_blocks_per_example: int,
+    max_primitive_actions_per_example: int,
+    seed: int = 0,
+    example_ids: Optional[Set[str]] = None,
+) -> int:
+    """Return the step-embedding capacity needed to measure every forced replay action."""
+    max_steps = 0
+    for trace_row in trace_rows:
+        example_id = trace_row.get("example_id")
+        if example_ids is not None and str(example_id) not in example_ids:
+            continue
+        replay_seed = f"{seed}:{example_id}:{trace_variant}"
+        replay_trace, _ = build_replay_trace(
+            trace_row,
+            trace_variant=trace_variant,
+            visual_or_region_min_improvement=visual_or_region_min_improvement,
+            think_min_improvement=think_min_improvement,
+            max_decision_blocks_per_example=max_decision_blocks_per_example,
+            max_primitive_actions_per_example=max_primitive_actions_per_example,
+            rng=random.Random(replay_seed),
+        )
+        max_steps = max(max_steps, len(replay_trace))
+    return max_steps
+
+
+def controller_checkpoint_step_capacity(checkpoint_path: str) -> Optional[int]:
+    """Read the saved step-embedding capacity without constructing a controller model."""
+    path = Path(checkpoint_path)
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu")
+    state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else {}
+    for name, tensor in state_dict.items():
+        if str(name).endswith("step_embedding.weight") and isinstance(tensor, torch.Tensor):
+            return int(tensor.size(0))
+    return None
+
+
+def resolve_replay_controller_max_steps(
+    configured_steps: int,
+    required_steps: int,
+    checkpoint_steps: Optional[int] = None,
+) -> int:
+    """Choose a replay capacity while keeping controller checkpoint tensor shapes loadable."""
+    if checkpoint_steps is not None:
+        if required_steps > checkpoint_steps:
+            raise ValueError(
+                f"Replay requires {required_steps} controller steps, but the controller checkpoint "
+                f"contains only {checkpoint_steps} step embeddings."
+            )
+        return checkpoint_steps
+    return max(configured_steps, required_steps)
 
 
 def next_token_entropy_from_state(
@@ -730,10 +806,10 @@ def main() -> None:
     parser.add_argument(
         "--trace-variant",
         default="raw",
-        choices=["raw", "filtered_cap", "filtered_no_cap", "no_visual", "no_reasoning", "shuffled"],
+        choices=["raw", "no_think", "filtered_cap", "filtered_no_cap", "no_visual", "no_reasoning", "shuffled"],
         help=(
-            "Replay the raw/filtered oracle trace, remove visual actions, bypass reasoning entirely, "
-            "or shuffle oracle decision blocks while keeping STOP terminal."
+            "Replay the raw/filtered oracle trace, remove THINK or visual actions, bypass reasoning "
+            "entirely, or shuffle oracle decision blocks while keeping STOP terminal."
         ),
     )
     parser.add_argument(
@@ -824,6 +900,35 @@ def main() -> None:
         raise ValueError("step_entropy_top_k must be a positive integer or null for full-vocabulary entropy.")
     step_entropy_top_k = int(step_entropy_top_k) if step_entropy_top_k is not None else None
     effective_context_mode = "full_context" if args.trace_variant == "no_reasoning" else context_mode
+
+    required_controller_max_steps = required_controller_max_steps_for_traces(
+        trace_rows,
+        trace_variant=args.trace_variant,
+        visual_or_region_min_improvement=visual_or_region_min_improvement,
+        think_min_improvement=think_min_improvement,
+        max_decision_blocks_per_example=max_decision_blocks,
+        max_primitive_actions_per_example=max_primitive_actions,
+        seed=seed,
+        example_ids=set(examples_by_id.keys()),
+    )
+    configured_controller_max_steps = int(
+        config["model"].get("controller_max_steps", config["model"].get("max_steps", 0))
+    )
+    checkpoint_controller_max_steps = (
+        controller_checkpoint_step_capacity(args.controller_path) if args.controller_path else None
+    )
+    resolved_controller_max_steps = resolve_replay_controller_max_steps(
+        configured_controller_max_steps,
+        required_controller_max_steps,
+        checkpoint_steps=checkpoint_controller_max_steps,
+    )
+    if resolved_controller_max_steps != configured_controller_max_steps:
+        config["model"]["controller_max_steps"] = resolved_controller_max_steps
+        print(
+            "Setting model.controller_max_steps from "
+            f"{configured_controller_max_steps} to {resolved_controller_max_steps} "
+            f"for {args.trace_variant} replay traces."
+        )
 
     model = QwenLVAR(config["model"])
     if args.controller_path:

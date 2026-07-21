@@ -1,4 +1,5 @@
 from .dataset import CLEVRCoGenTDataset, M3CoTDataset, ScienceQADataset, build_dataset
+from .cosine_mining import CosineSimilarityTraceMiner, select_top_k_patches, summarize_cosine_trace_rows
 from .oracle_mining import (
     OracleTraceMiner,
     build_step_target,
@@ -20,6 +21,9 @@ __all__ = [
     "M3CoTDataset",
     "ScienceQADataset",
     "build_dataset",
+    "CosineSimilarityTraceMiner",
+    "select_top_k_patches",
+    "summarize_cosine_trace_rows",
     "OracleTraceMiner",
     "build_step_target",
     "group_steps_to_max",
