@@ -42,6 +42,7 @@ fi
 mkdir -p "${EVAL_ROOT}"
 
 while IFS=$'\t' read -r trace_source variant config_path checkpoint_path; do
+  checkpoint_path="${checkpoint_path%$'\r'}"
   if [[ ! -f "${config_path}" ]]; then
     echo "Missing config for ${trace_source}/${variant}: ${config_path}" >&2
     exit 2
