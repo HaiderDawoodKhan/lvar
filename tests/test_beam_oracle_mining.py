@@ -5,6 +5,7 @@ from pathlib import Path
 
 from lvar.beam_oracle_mining import BeamOracleTraceMiner, BeamTrajectory
 from lvar.controller_sft import load_mined_trace_rows
+from lvar_scripts.eval_mined_traces_m3cot import select_best_beam_trajectory
 from test_model import build_model
 
 
@@ -64,6 +65,19 @@ class BeamOracleMiningTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["beam_rank"] for row in rows], [1, 2])
         self.assertEqual(rows[0]["decisions"][0]["actions"][0]["type"], "PATCH")
+
+    def test_replay_selects_rank_one_beam_even_when_top_level_trace_differs(self):
+        row = {
+            "trace": [{"type": "THINK"}, {"type": "STOP"}],
+            "beam_trajectories": [
+                {"rank": 2, "weighted_ce": 0.1, "trace": [{"type": "THINK"}, {"type": "STOP"}], "decisions": []},
+                {"rank": 1, "weighted_ce": 0.2, "trace": [{"type": "PATCH", "patch_idx": 3}, {"type": "STOP"}], "decisions": []},
+            ],
+        }
+        selected = select_best_beam_trajectory(row)
+
+        self.assertEqual(selected["selected_beam_rank"], 1)
+        self.assertEqual(selected["trace"][0], {"type": "PATCH", "patch_idx": 3})
 
 
 if __name__ == "__main__":

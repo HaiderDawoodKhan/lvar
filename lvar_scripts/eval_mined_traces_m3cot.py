@@ -41,10 +41,35 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
             if not stripped:
                 continue
             try:
-                rows.append(json.loads(stripped))
+                rows.append(select_best_beam_trajectory(json.loads(stripped)))
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSON in {path} at line {line_number}: {exc}") from exc
     return rows
+
+
+def select_best_beam_trajectory(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve a beam-oracle row to its best stored trajectory for replay.
+
+    Beam mining also materializes rank 1 at the legacy top level, but selecting
+    here makes replay robust to rows that contain only ``beam_trajectories``.
+    Greedy datasets pass through unchanged.
+    """
+    trajectories = row.get("beam_trajectories") or []
+    if not trajectories:
+        return row
+    best = min(
+        trajectories,
+        key=lambda trajectory: (
+            int(trajectory.get("rank", 10**9)),
+            float(trajectory.get("weighted_ce", float("inf"))),
+        ),
+    )
+    selected = dict(row)
+    selected["trace"] = best.get("trace") or []
+    selected["decisions"] = best.get("decisions") or []
+    selected["selected_beam_rank"] = best.get("rank")
+    selected["selected_beam_weighted_ce"] = best.get("weighted_ce")
+    return selected
 
 
 def write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -1056,6 +1081,8 @@ def main() -> None:
                 "context_mode": effective_context_mode,
                 "trace_variant": args.trace_variant,
                 "visual_index_mode": args.visual_index_mode,
+                "selected_beam_rank": trace_row.get("selected_beam_rank"),
+                "selected_beam_weighted_ce": trace_row.get("selected_beam_weighted_ce"),
                 "correct": is_correct,
                 "num_trace_actions": len(decoded["trace"]),
                 "num_output_tokens": len(decoded["generated_ids"]),
