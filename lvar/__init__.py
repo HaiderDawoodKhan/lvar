@@ -7,6 +7,7 @@ from .oracle_mining import (
     preprocess_reasoning_steps,
     split_rationale_into_sentences,
 )
+from .beam_oracle_mining import BeamOracleTraceMiner
 from .qwen_lvar import QwenLVAR
 from .trace_attention_boost import TraceBoostConfig
 from .rewards import (
@@ -25,6 +26,7 @@ __all__ = [
     "select_top_k_patches",
     "summarize_cosine_trace_rows",
     "OracleTraceMiner",
+    "BeamOracleTraceMiner",
     "build_step_target",
     "group_steps_to_max",
     "preprocess_reasoning_steps",

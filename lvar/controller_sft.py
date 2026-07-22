@@ -42,16 +42,30 @@ PHASE3_V2_TYPE_LOSS_WEIGHTS = {
 
 
 def load_mined_trace_rows(path: str | Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Load Phase 2 mined JSONL rows."""
+    """Load Phase 2 rows, expanding optional beam trajectories for SFT."""
     rows: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
             if not stripped:
                 continue
-            rows.append(json.loads(stripped))
-            if limit is not None and len(rows) >= limit:
-                break
+            row = json.loads(stripped)
+            trajectories = row.get("beam_trajectories") or []
+            if trajectories:
+                for trajectory in trajectories:
+                    expanded = dict(row)
+                    expanded["trace"] = trajectory.get("trace") or []
+                    expanded["decisions"] = trajectory.get("decisions") or []
+                    expanded["beam_rank"] = trajectory.get("rank")
+                    expanded["beam_weighted_ce"] = trajectory.get("weighted_ce")
+                    expanded.pop("beam_trajectories", None)
+                    rows.append(expanded)
+                    if limit is not None and len(rows) >= limit:
+                        return rows
+            else:
+                rows.append(row)
+                if limit is not None and len(rows) >= limit:
+                    return rows
     return rows
 
 

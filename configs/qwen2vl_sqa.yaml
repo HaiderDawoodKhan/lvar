@@ -49,6 +49,19 @@ phase2:
   output_path: outputs/phase2_sqa_traces.jsonl
   initial_visual_mode: global_mean
 
+phase2_beam:
+  seed: 42
+  max_steps: 5
+  beam_width: 3
+  max_actions_per_stage: 4
+  patch_top_k: 32
+  ce_improvement_threshold: 0.01
+  rationale_ce_weight: 0.4
+  image_size: 280
+  resume: true
+  start_from_end: false
+  output_path: outputs/phase2_sqa_beam_traces.jsonl
+
 phase3:
   seed: 42
   trace_path: outputs/phase2_sqa_traces.jsonl
