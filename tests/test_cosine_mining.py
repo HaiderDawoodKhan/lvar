@@ -34,7 +34,7 @@ class CosineSimilarityMiningTests(unittest.TestCase):
 
     def test_miner_builds_cumulative_patch_think_blocks_and_terminal_stop(self):
         model = build_model(think_append_hidden=True)
-        miner = CosineSimilarityTraceMiner(model, top_k=3, max_steps=8, image_size=None)
+        miner = CosineSimilarityTraceMiner(model, top_k=3, max_steps=8, image_size=None, mining_mode="sequential")
         row = miner.mine_example(
             {
                 "id": "ex-1",
@@ -74,6 +74,36 @@ class CosineSimilarityMiningTests(unittest.TestCase):
         self.assertNotIn("D", " ".join(row["steps"]))
         self.assertEqual(miner.get_summary()["num_patch_actions"], 6)
         self.assertEqual(miner.get_summary()["num_think_actions"], 2)
+
+    def test_single_pass_is_default_and_does_not_insert_patches_or_think(self):
+        model = build_model(think_append_hidden=True)
+        forward_calls = {"count": 0}
+        original_forward = model.backbone.forward
+
+        def counting_forward(*args, **kwargs):
+            forward_calls["count"] += 1
+            return original_forward(*args, **kwargs)
+
+        model.backbone.forward = counting_forward
+        miner = CosineSimilarityTraceMiner(model, top_k=3, max_steps=8, image_size=None)
+        row = miner.mine_example(
+            {
+                "id": "ex-1",
+                "image": "image",
+                "question": "question",
+                "steps": ["Inspect the object.", "Choose the matching option."],
+                "solution": "Inspect the object. Choose the matching option.\n<answer>D</answer>",
+            }
+        )
+
+        self.assertEqual(miner.mining_mode, "single_pass")
+        self.assertEqual(forward_calls["count"], 1)
+        self.assertEqual(
+            [action["type"] for action in row["trace"]],
+            ["PATCH", "PATCH", "PATCH", "PATCH", "PATCH", "PATCH", "STOP"],
+        )
+        self.assertEqual(row["mining_mode"], "single_pass")
+        self.assertEqual(row["decisions"][0]["sequence_length_after_actions"], row["decisions"][0]["sequence_length_after_step"])
 
     def test_pending_indices_support_resume_and_reverse_order(self):
         dataset = [{"id": "a"}, {"id": "b"}, {"id": "c"}]

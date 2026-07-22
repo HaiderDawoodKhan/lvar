@@ -8,7 +8,15 @@ LIMIT="${LIMIT:-}"
 SEED="${SEED:-42}"
 TOP_K=3
 MAX_RATIONALE_STEPS=8
-MAX_CONTROLLER_STEPS=33
+MAX_CONTROLLER_STEPS="${MAX_CONTROLLER_STEPS:-}"
+MINING_MODE="${MINING_MODE:-single_pass}"
+if [[ -z "${MAX_CONTROLLER_STEPS:-}" ]]; then
+  if [[ "${MINING_MODE}" == "sequential" ]]; then
+    MAX_CONTROLLER_STEPS=33
+  else
+    MAX_CONTROLLER_STEPS=25
+  fi
+fi
 
 if [[ -z "${CHECKPOINT_PATH}" ]]; then
   echo "Set CHECKPOINT_PATH or pass the base LVAR checkpoint as the first argument." >&2
@@ -52,12 +60,13 @@ python lvar_scripts/mine_cosine_similarity.py \
   --use-checkpoint \
   --top-k "${TOP_K}" \
   --max-steps "${MAX_RATIONALE_STEPS}" \
+  --mining-mode "${MINING_MODE}" \
   --seed "${SEED}" \
   --output "${test_trace}" \
   --resume \
   "${limit_args[@]}"
 
-echo "[2/6] Replaying test traces with THINK..."
+echo "[2/6] Replaying test traces (raw ${MINING_MODE} trace)..."
 python lvar_scripts/eval_mined_traces_m3cot.py \
   --config "${CONFIG}" \
   --dataset-partition test \
@@ -91,6 +100,7 @@ python lvar_scripts/mine_cosine_similarity.py \
   --use-checkpoint \
   --top-k "${TOP_K}" \
   --max-steps "${MAX_RATIONALE_STEPS}" \
+  --mining-mode "${MINING_MODE}" \
   --seed "${SEED}" \
   --output "${train_trace}" \
   --resume \

@@ -73,6 +73,12 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument(
+        "--mining-mode",
+        choices=["single_pass", "sequential"],
+        default="single_pass",
+        help="single_pass uses one LM forward pass; sequential inserts patches and THINK between steps.",
+    )
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--start-from-end", "--reverse", dest="start_from_end", action="store_true")
@@ -110,6 +116,7 @@ def main() -> None:
         top_k=args.top_k,
         max_steps=args.max_steps,
         image_size=args.image_size if args.image_size is not None else phase2_cfg.get("image_size", 280),
+        mining_mode=args.mining_mode,
     )
 
     file_mode = "a" if args.resume else "w"
@@ -121,6 +128,7 @@ def main() -> None:
         read_jsonl_rows(output_path),
         top_k=args.top_k,
         max_steps=args.max_steps,
+        mining_mode=args.mining_mode,
     )
     summary.update(
         {
