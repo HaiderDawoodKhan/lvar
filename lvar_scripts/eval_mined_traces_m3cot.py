@@ -33,7 +33,8 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return yaml.safe_load(handle)
 
 
-def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+def read_jsonl(path: Path, beam_rank: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Read traces, selecting one requested trajectory from beam-oracle rows."""
     rows = []
     with open(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -41,34 +42,55 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
             if not stripped:
                 continue
             try:
-                rows.append(select_best_beam_trajectory(json.loads(stripped)))
+                selected = select_beam_trajectory(json.loads(stripped), beam_rank=beam_rank)
+                if selected is not None:
+                    rows.append(selected)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSON in {path} at line {line_number}: {exc}") from exc
     return rows
 
 
-def select_best_beam_trajectory(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve a beam-oracle row to its best stored trajectory for replay.
+def select_beam_trajectory(
+    row: Dict[str, Any],
+    beam_rank: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve one requested beam trajectory for replay.
 
-    Beam mining also materializes rank 1 at the legacy top level, but selecting
-    here makes replay robust to rows that contain only ``beam_trajectories``.
-    Greedy datasets pass through unchanged.
+    A missing requested rank is omitted, so rank-2/3 accuracy is computed only
+    over prompts that actually retained that trajectory.  Legacy and greedy
+    datasets are rank-1-only and therefore still replay normally by default.
     """
     trajectories = row.get("beam_trajectories") or []
     if not trajectories:
-        return row
-    best = min(
-        trajectories,
-        key=lambda trajectory: (
-            int(trajectory.get("rank", 10**9)),
-            float(trajectory.get("weighted_ce", float("inf"))),
-        ),
-    )
+        return row if beam_rank in {None, 1} else None
+    if beam_rank is None:
+        selected_trajectory = min(
+            trajectories,
+            key=lambda trajectory: (
+                int(trajectory.get("rank", 10**9)),
+                float(trajectory.get("weighted_ce", float("inf"))),
+            ),
+        )
+    else:
+        selected_trajectory = next(
+            (trajectory for trajectory in trajectories if int(trajectory.get("rank", -1)) == int(beam_rank)),
+            None,
+        )
+        if selected_trajectory is None:
+            return None
     selected = dict(row)
-    selected["trace"] = best.get("trace") or []
-    selected["decisions"] = best.get("decisions") or []
-    selected["selected_beam_rank"] = best.get("rank")
-    selected["selected_beam_weighted_ce"] = best.get("weighted_ce")
+    selected["trace"] = selected_trajectory.get("trace") or []
+    selected["decisions"] = selected_trajectory.get("decisions") or []
+    selected["selected_beam_rank"] = selected_trajectory.get("rank")
+    selected["selected_beam_weighted_ce"] = selected_trajectory.get("weighted_ce")
+    return selected
+
+
+def select_best_beam_trajectory(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Backward-compatible lowest-rank beam selector used by existing callers."""
+    selected = select_beam_trajectory(row, beam_rank=None)
+    if selected is None:
+        raise ValueError("Beam row does not contain rank 1.")
     return selected
 
 
@@ -826,6 +848,12 @@ def main() -> None:
     parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     parser.add_argument("--trace-path", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--beam-rank",
+        type=int,
+        default=1,
+        help="Beam trajectory rank to replay (default: 1). Rows missing that rank are skipped.",
+    )
     parser.add_argument("--dataset-partition", default="test")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
@@ -881,6 +909,8 @@ def main() -> None:
     add_model_loading_args(parser)
     add_trace_boost_args(parser)
     args = parser.parse_args()
+    if args.beam_rank < 1:
+        parser.error("--beam-rank must be >= 1.")
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
@@ -897,7 +927,7 @@ def main() -> None:
         torch.cuda.manual_seed_all(seed)
 
     trace_path = Path(args.trace_path)
-    trace_rows = read_jsonl(trace_path)
+    trace_rows = read_jsonl(trace_path, beam_rank=args.beam_rank)
     dataset = build_dataset(dataset_cfg, limit=args.limit, partition=args.dataset_partition)
     examples_by_id = collect_dataset_by_id(dataset)
     context_mode = normalize_context_mode(args.context)
@@ -1125,6 +1155,7 @@ def main() -> None:
         "context": args.context,
         "context_mode": effective_context_mode,
         "trace_variant": args.trace_variant,
+        "beam_rank_requested": args.beam_rank,
         "visual_index_mode": args.visual_index_mode,
         "filtering": {
             "visual_or_region_min_improvement": visual_or_region_min_improvement,

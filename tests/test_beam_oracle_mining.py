@@ -5,7 +5,7 @@ from pathlib import Path
 
 from lvar.beam_oracle_mining import BeamOracleTraceMiner, BeamTrajectory
 from lvar.controller_sft import load_mined_trace_rows
-from lvar_scripts.eval_mined_traces_m3cot import select_best_beam_trajectory
+from lvar_scripts.eval_mined_traces_m3cot import read_jsonl, select_beam_trajectory, select_best_beam_trajectory
 from test_model import build_model
 
 
@@ -78,6 +78,25 @@ class BeamOracleMiningTests(unittest.TestCase):
 
         self.assertEqual(selected["selected_beam_rank"], 1)
         self.assertEqual(selected["trace"][0], {"type": "PATCH", "patch_idx": 3})
+
+    def test_replay_can_select_or_skip_a_requested_beam_rank(self):
+        row = {
+            "beam_trajectories": [
+                {"rank": 1, "weighted_ce": 0.2, "trace": [{"type": "PATCH", "patch_idx": 3}], "decisions": []},
+                {"rank": 2, "weighted_ce": 0.3, "trace": [{"type": "THINK"}], "decisions": []},
+            ],
+        }
+        selected = select_beam_trajectory(row, beam_rank=2)
+
+        self.assertEqual(selected["selected_beam_rank"], 2)
+        self.assertEqual(selected["trace"], [{"type": "THINK"}])
+        self.assertIsNone(select_beam_trajectory(row, beam_rank=3))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "traces.jsonl"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            self.assertEqual(len(read_jsonl(path, beam_rank=2)), 1)
+            self.assertEqual(read_jsonl(path, beam_rank=3), [])
 
 
 if __name__ == "__main__":

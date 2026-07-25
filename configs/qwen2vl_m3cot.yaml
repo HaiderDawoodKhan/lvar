@@ -62,6 +62,19 @@ phase2_beam:
   start_from_end: false
   output_path: outputs/phase2_m3cot_beam_traces.jsonl
 
+phase2_greedy:
+  # Matches phase2_beam except beam_width is fixed to one in the greedy script.
+  seed: 42
+  max_steps: 5
+  max_actions_per_stage: 4
+  patch_top_k: 32
+  ce_improvement_threshold: 0.01
+  rationale_ce_weight: 0.4
+  image_size: 280
+  resume: true
+  start_from_end: false
+  output_path: outputs/phase2_m3cot_greedy_traces.jsonl
+
 phase3:
   seed: 42
   trace_path: outputs/phase2_m3cot_traces.jsonl

@@ -2,9 +2,15 @@
 # Mine optional beam-oracle traces, replay test traces, then train on train traces.
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This script lives in run_scripts/beam_mining/, so the repository root is
+# two levels above it (not one level above, which is run_scripts/).
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ ! -f "${ROOT_DIR}/lvar_scripts/mine_phase2_beam.py" ]]; then
+  echo "Could not locate lvar_scripts/mine_phase2_beam.py below ${ROOT_DIR}." >&2
+  exit 1
+fi
 CONFIG_PATH="${1:-${ROOT_DIR}/configs/qwen2vl_m3cot.yaml}"
-OUTPUT_DIR="${2:-${ROOT_DIR}/outputs/m3cot_beam_oracle_pipeline}"
+OUTPUT_DIR="${2:-${ROOT_DIR}/outputs/beam_oracle_dataset/m3cot}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 TEST_TRACES="${OUTPUT_DIR}/m3cot_test_beam_traces.jsonl"
