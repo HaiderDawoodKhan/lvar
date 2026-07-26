@@ -75,6 +75,35 @@ phase2_greedy:
   start_from_end: false
   output_path: outputs/phase2_m3cot_greedy_traces.jsonl
 
+phase2_greedy_fast:
+  # Rank candidates once per stage, then test only the top six proposals.
+  seed: 42
+  max_steps: 5
+  max_actions_per_stage: 4
+  patch_top_k: 100
+  proposal_count: 6
+  ce_improvement_threshold: 0.01
+  rationale_ce_weight: 0.4
+  image_size: 280
+  resume: true
+  start_from_end: false
+  output_path: outputs/phase2_m3cot_greedy_fast_traces.jsonl
+
+phase2_beam_search_fast:
+  # Three first-action beams; each follows its parent's fixed top-six ranking.
+  seed: 42
+  max_steps: 5
+  beam_width: 3
+  max_actions_per_stage: 4
+  patch_top_k: 100
+  proposal_count: 6
+  ce_improvement_threshold: 0.01
+  rationale_ce_weight: 0.4
+  image_size: 280
+  resume: true
+  start_from_end: false
+  output_path: outputs/phase2_m3cot_beam_search_fast_traces.jsonl
+
 phase3:
   seed: 42
   trace_path: outputs/phase2_m3cot_traces.jsonl

@@ -8,6 +8,7 @@ from .oracle_mining import (
     split_rationale_into_sentences,
 )
 from .beam_oracle_mining import BeamOracleTraceMiner
+from .fast_oracle_mining import BeamSearchFastOracleTraceMiner, GreedyFastOracleTraceMiner
 from .qwen_lvar import QwenLVAR
 from .trace_attention_boost import TraceBoostConfig
 from .rewards import (
@@ -27,6 +28,8 @@ __all__ = [
     "summarize_cosine_trace_rows",
     "OracleTraceMiner",
     "BeamOracleTraceMiner",
+    "GreedyFastOracleTraceMiner",
+    "BeamSearchFastOracleTraceMiner",
     "build_step_target",
     "group_steps_to_max",
     "preprocess_reasoning_steps",

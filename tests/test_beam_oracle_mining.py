@@ -5,6 +5,7 @@ from pathlib import Path
 
 from lvar.beam_oracle_mining import BeamOracleTraceMiner, BeamTrajectory
 from lvar.controller_sft import load_mined_trace_rows
+from lvar.fast_oracle_mining import BeamSearchFastOracleTraceMiner, GreedyFastOracleTraceMiner
 from lvar_scripts.eval_mined_traces_m3cot import read_jsonl, select_beam_trajectory, select_best_beam_trajectory
 from test_model import build_model
 
@@ -97,6 +98,57 @@ class BeamOracleMiningTests(unittest.TestCase):
             path.write_text(json.dumps(row) + "\n", encoding="utf-8")
             self.assertEqual(len(read_jsonl(path, beam_rank=2)), 1)
             self.assertEqual(read_jsonl(path, beam_rank=3), [])
+
+    def test_greedy_fast_scores_candidates_once_then_checks_fixed_prefixes(self):
+        miner = GreedyFastOracleTraceMiner(
+            self.model,
+            max_actions_per_stage=3,
+            patch_top_k=2,
+            proposal_count=3,
+            ce_improvement_threshold=0.01,
+        )
+        state = self.model.build_initial_state(self.prepared)
+        base_length = state["inputs_embeds"].size(1)
+        miner._attended_patch_indices = lambda trajectory, bank, image_positions: [0, 1]
+        miner._score_components = lambda candidate_state, rationale, answer: (
+            10.0 - 0.02 * (candidate_state["inputs_embeds"].size(1) - base_length),
+            10.0 - 0.02 * (candidate_state["inputs_embeds"].size(1) - base_length),
+            10.0 - 0.02 * (candidate_state["inputs_embeds"].size(1) - base_length),
+        )
+        initial = BeamTrajectory(state=state, score=10.0, ce_rationale=10.0, ce_answer=10.0)
+        beams = miner._search_stage([initial], 0, "later rationale", "answer", self.bank, [1, 2, 3, 4])
+
+        self.assertEqual(len(beams), 1)
+        decision = beams[0].decisions[-1]
+        self.assertEqual(len(decision["ranked_candidates"]), 3)
+        self.assertEqual(len(decision["actions"]), 3)
+        self.assertEqual(miner.summary["num_initial_candidate_scores"], 3)
+        self.assertEqual(miner.summary["num_prefix_scores"], 2)
+
+    def test_beam_fast_branches_once_then_keeps_fixed_rankings(self):
+        miner = BeamSearchFastOracleTraceMiner(
+            self.model,
+            beam_width=3,
+            max_actions_per_stage=2,
+            patch_top_k=2,
+            proposal_count=3,
+            ce_improvement_threshold=0.01,
+        )
+        state = self.model.build_initial_state(self.prepared)
+        base_length = state["inputs_embeds"].size(1)
+        miner._attended_patch_indices = lambda trajectory, bank, image_positions: [0, 1]
+        miner._score_components = lambda candidate_state, rationale, answer: (
+            10.0 - 0.02 * (candidate_state["inputs_embeds"].size(1) - base_length),
+            10.0 - 0.02 * (candidate_state["inputs_embeds"].size(1) - base_length),
+            10.0 - 0.02 * (candidate_state["inputs_embeds"].size(1) - base_length),
+        )
+        initial = BeamTrajectory(state=state, score=10.0, ce_rationale=10.0, ce_answer=10.0)
+        beams = miner._search_stage([initial], 0, "later rationale", "answer", self.bank, [1, 2, 3, 4])
+
+        self.assertEqual(len(beams), 3)
+        self.assertEqual(miner.summary["num_initial_candidate_scores"], 3)
+        self.assertEqual(miner.summary["num_prefix_scores"], 3)
+        self.assertTrue(all(len(beam.decisions[-1]["actions"]) == 2 for beam in beams))
 
 
 if __name__ == "__main__":
