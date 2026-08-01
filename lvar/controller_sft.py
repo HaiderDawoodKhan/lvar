@@ -8,36 +8,29 @@ import torch
 import torch.nn.functional as F
 
 from lvar.utils import (
-    ACTION_GLOBAL,
     ACTION_NAME_TO_ID,
     ACTION_PATCH,
-    ACTION_REGION,
     ACTION_STOP,
     ACTION_THINK,
 )
 
 
 ACTION_TYPE_IDS = {
-    "THINK": ACTION_THINK,
-    "GLOBAL": ACTION_GLOBAL,
-    "REGION": ACTION_REGION,
     "PATCH": ACTION_PATCH,
+    "THINK": ACTION_THINK,
     "STOP": ACTION_STOP,
 }
 
 DEFAULT_TYPE_LOSS_WEIGHTS = {
     "PATCH": 1.0,
-    "REGION": 1.0,
     "THINK": 1.0,
-    "GLOBAL": 1.0,
     "STOP": 1.0,
 }
 
 PHASE3_V2_TYPE_LOSS_WEIGHTS = {
     "PATCH": 1.0,
-    "REGION": 2.5,
-    "THINK": 5.0,
-    "STOP": 5.0,
+    "THINK": 2.0,
+    "STOP": 3.0,
 }
 
 
@@ -117,7 +110,6 @@ def compute_action_loss(
     type_weight = float((type_loss_weights or DEFAULT_TYPE_LOSS_WEIGHTS).get(name, 1.0))
     type_loss = raw_type_loss * type_weight
     patch_loss = torch.zeros((), device=device, dtype=type_loss.dtype)
-    region_loss = torch.zeros((), device=device, dtype=type_loss.dtype)
     loss = type_loss
 
     if name == "PATCH":
@@ -125,12 +117,6 @@ def compute_action_loss(
         target_patch = torch.tensor([patch_idx], device=device, dtype=torch.long)
         patch_loss = F.cross_entropy(patch_logits, target_patch)
         loss = loss + patch_loss
-    elif name == "REGION":
-        region_idx = int(action["region_idx"])
-        target_region = torch.tensor([region_idx], device=device, dtype=torch.long)
-        region_loss = F.cross_entropy(region_logits, target_region)
-        loss = loss + region_loss
-
     if return_components:
         return loss, {
             "action_type": name,
@@ -138,7 +124,7 @@ def compute_action_loss(
             "type_loss": type_loss,
             "raw_type_loss": raw_type_loss,
             "patch_loss": patch_loss,
-            "region_loss": region_loss,
+            "region_loss": torch.zeros((), device=device, dtype=type_loss.dtype),
         }
     return loss
 
@@ -205,11 +191,15 @@ def _decision_improvement(decision: Dict[str, Any]) -> float:
     return float(ce_noop) - float(ce_selected)
 
 
-def _clean_decision_actions(actions: Iterable[Dict[str, Any]], remove_global: bool) -> List[Dict[str, Any]]:
+def _clean_decision_actions(actions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only actions represented by the three-way controller head.
+
+    GLOBAL and REGION are always discarded because neither has a policy logit.
+    """
     cleaned: List[Dict[str, Any]] = []
     for action in actions:
         action_name = str(action.get("type", "")).upper()
-        if remove_global and action_name == "GLOBAL":
+        if action_name not in ACTION_TYPE_IDS or action_name == "STOP":
             continue
         copied = dict(action)
         copied["type"] = action_name
@@ -218,7 +208,7 @@ def _clean_decision_actions(actions: Iterable[Dict[str, Any]], remove_global: bo
 
 
 def _is_visual_block(actions: List[Dict[str, Any]]) -> bool:
-    return any(str(action.get("type", "")).upper() in {"PATCH", "REGION", "GLOBAL"} for action in actions)
+    return any(str(action.get("type", "")).upper() == "PATCH" for action in actions)
 
 
 def transform_phase3_v2_decision_blocks(
@@ -228,7 +218,6 @@ def transform_phase3_v2_decision_blocks(
     max_decision_blocks_per_example: int = 6,
     max_primitive_actions_per_example: int = 8,
     no_op_stop_ce_threshold: float = 0.05,
-    remove_global: bool = True,
 ) -> Tuple[List[List[Dict[str, Any]]], Dict[str, Any]]:
     """Clean mined decisions into capped Phase 3 v2 supervision blocks."""
     candidates: List[Tuple[int, float, List[Dict[str, Any]]]] = []
@@ -246,9 +235,9 @@ def transform_phase3_v2_decision_blocks(
             skipped["noop"] += 1
             continue
 
-        actions = _clean_decision_actions(raw_actions, remove_global=remove_global)
+        actions = _clean_decision_actions(raw_actions)
         if not actions:
-            skipped["global"] += 1
+            skipped["unsupported_action"] += 1
             continue
 
         improvement = _decision_improvement(decision)
@@ -409,7 +398,6 @@ def replay_controller_sft_loss(
     max_decision_blocks_per_example: int = 6,
     max_primitive_actions_per_example: int = 8,
     no_op_stop_ce_threshold: float = 0.05,
-    remove_global: bool = False,
     visual_block_dropout_p: float = 0.0,
     multi_hot_patch_labels: bool = False,
     multi_hot_patch_target_mode: str = "binary",
@@ -483,17 +471,16 @@ def replay_controller_sft_loss(
             max_decision_blocks_per_example=max_decision_blocks_per_example,
             max_primitive_actions_per_example=max_primitive_actions_per_example,
             no_op_stop_ce_threshold=no_op_stop_ce_threshold,
-            remove_global=remove_global,
         )
         skipped_noop = int(transform_metrics.get("skipped_blocks", {}).get("noop", 0))
     else:
         blocks = []
         for decision in mined_row.get("decisions", []):
-            actions = decision.get("actions") or []
+            actions = _clean_decision_actions(decision.get("actions") or [])
             if not actions:
                 skipped_noop += 1
                 continue
-            blocks.append([dict(action) for action in actions])
+            blocks.append(actions)
         blocks.append([{"type": "STOP"}])
 
     def apply_visual_dropout(block: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:

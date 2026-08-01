@@ -60,7 +60,7 @@ class ControllerHead(nn.Module):
 
         Attributes:
             fuse: MLP combining controller state embeddings.
-            type_head: Produces logits for THINK/STOP/GLOBAL/REGION/PATCH.
+            type_head: Produces logits for PATCH/THINK/STOP only.
             region_head: Produces logits over fixed region indices.
             patch_head: Produces logits over fixed patch indices.
         """
@@ -160,6 +160,11 @@ class QwenLVAR(nn.Module):
         self.controller_num_regions = int(cfg.get("controller_num_regions", 25))
         self.controller_num_patches = int(cfg.get("controller_num_patches", 100))
         self.action_names = normalize_action_names(cfg.get("controller_action_names"))
+        if self.action_names != ACTION_NAMES:
+            raise ValueError(
+                "controller_action_names must be exactly [PATCH, THINK, STOP]; "
+                f"got {self.action_names}."
+            )
         self.action_name_to_id = {name: idx for idx, name in self.action_names.items()}
         self.mask_immediate_repeats = bool(cfg.get("mask_immediate_repeats", False))
         self.nucleus_insertion_enabled = bool(cfg.get("nucleus_insertion_enabled", False))
@@ -1728,27 +1733,13 @@ class QwenLVAR(nn.Module):
         action_name = self.action_names[action_id]
         should_stop = action_name == "STOP"
 
-        # Map action to evidence token selection. THINK and STOP add no evidence.
+        # PATCH selects evidence; THINK and STOP do not insert visual tokens.
         region_index = None
         patch_index = None
         region_indices: List[int] = []
         patch_indices: List[int] = []
         evidence_tokens: List[torch.Tensor] = []
-        if action_name == "GLOBAL":
-            evidence_tokens = [bank["global"][0].unsqueeze(0)]
-        elif action_name == "REGION":
-            if self._nucleus_insertion_applies("region"):
-                region_indices, region_log_prob = self._select_nucleus_indices(scaled_region_logits)
-            else:
-                region_tensor, region_log_prob = self._select_index(
-                    scaled_region_logits,
-                    state.get("sample_actions", False),
-                )
-                region_indices = [int(region_tensor.item())]
-            region_index = region_indices[0]
-            action_log_prob = action_log_prob + region_log_prob
-            evidence_tokens = [bank["raw_regions"][index] for index in region_indices]
-        elif action_name == "PATCH":
+        if action_name == "PATCH":
             if self._nucleus_insertion_applies("patch"):
                 patch_indices, patch_log_prob = self._select_nucleus_indices(scaled_patch_logits)
             else:
@@ -1800,8 +1791,7 @@ class QwenLVAR(nn.Module):
             "region_indices": region_indices,
             "patch_indices": patch_indices,
             "nucleus_insertion_applied": bool(
-                (action_name == "REGION" and self._nucleus_insertion_applies("region"))
-                or (action_name == "PATCH" and self._nucleus_insertion_applies("patch"))
+                action_name == "PATCH" and self._nucleus_insertion_applies("patch")
             ),
             "nucleus_insertion_top_p": self.nucleus_insertion_top_p,
             "nucleus_insertion_scope": self.nucleus_insertion_scope,

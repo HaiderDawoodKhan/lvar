@@ -26,7 +26,7 @@ from lvar.controller_sft import (
 from lvar.dataset import build_dataset
 from lvar.grpo_training import load_vlm_lora_checkpoint
 from lvar.qwen_lvar import QwenLVAR
-from lvar.utils import ACTION_NAMES_NO_GLOBAL, add_model_loading_args, apply_model_loading_overrides
+from lvar.utils import add_model_loading_args, apply_model_loading_overrides
 
 
 def load_config(config_path: str):
@@ -107,10 +107,7 @@ def main() -> None:
         model_cfg["controller_max_steps"] = int(phase3_cfg["controller_max_steps"])
     phase3_v2 = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
     v2_value = lambda key, default: phase3_v2_cfg.get(key, phase3_cfg.get(key, default))
-    remove_global = bool(v2_value("remove_global", True))
     mask_immediate_repeats = bool(v2_value("mask_immediate_repeats", True))
-    if phase3_v2 and remove_global:
-        model_cfg["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if phase3_v2:
         model_cfg["mask_immediate_repeats"] = mask_immediate_repeats
 
@@ -237,7 +234,6 @@ def main() -> None:
                 max_decision_blocks_per_example=max_decision_blocks,
                 max_primitive_actions_per_example=max_primitive_actions,
                 no_op_stop_ce_threshold=no_op_stop_ce_threshold,
-                remove_global=remove_global,
                 visual_block_dropout_p=visual_block_dropout_p,
                 multi_hot_patch_labels=multi_hot_patch_labels,
                 multi_hot_patch_target_mode=multi_hot_patch_target_mode,

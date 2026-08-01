@@ -17,7 +17,6 @@ from lvar.grpo_training import load_controller_checkpoint, load_vlm_lora_checkpo
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import verify_choice_output
 from lvar.utils import (
-    ACTION_NAMES_NO_GLOBAL,
     add_model_loading_args,
     add_trace_boost_args,
     apply_model_loading_overrides,
@@ -157,12 +156,6 @@ def main() -> None:
 
     if "action_selection" in inference_cfg:
         config["model"]["action_selection"] = inference_cfg["action_selection"]
-    phase3_cfg = config.get("phase3", {})
-    phase3_v2_cfg = config.get("phase3_v2", {})
-    phase3_v2_enabled = bool(phase3_cfg.get("phase3_v2", phase3_v2_cfg.get("enabled", False)))
-    phase3_v2_removes_global = bool(phase3_v2_cfg.get("remove_global", phase3_cfg.get("remove_global", True)))
-    if phase3_v2_enabled and phase3_v2_removes_global:
-        config["model"]["controller_action_names"] = list(ACTION_NAMES_NO_GLOBAL.values())
     if "mask_immediate_repeats" in inference_cfg:
         config["model"]["mask_immediate_repeats"] = bool(inference_cfg["mask_immediate_repeats"])
     for key in (

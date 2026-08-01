@@ -3,29 +3,28 @@ import argparse
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-# Discrete action ids used by the controller and trace utilities.
-ACTION_THINK = 0
-ACTION_STOP = 1
-ACTION_GLOBAL = 2
-ACTION_REGION = 3
-ACTION_PATCH = 4
+# Discrete action ids used by the controller and trace utilities.  The policy
+# is intentionally limited to patch selection, latent thinking, and stopping.
+ACTION_PATCH = 0
+ACTION_THINK = 1
+ACTION_STOP = 2
 
-# Stable id->name and name->id maps used by model code and debug output.
+# Legacy oracle-only actions are retained as distinct constants so old mined
+# traces can be read and filtered, but they are not controller outputs.
+ACTION_GLOBAL = 3
+ACTION_REGION = 4
+
+# Stable id->name and name->id maps used by controller model code and debug output.
 ACTION_NAMES: Dict[int, str] = {
+    ACTION_PATCH: "PATCH",
     ACTION_THINK: "THINK",
     ACTION_STOP: "STOP",
-    ACTION_GLOBAL: "GLOBAL",
-    ACTION_REGION: "REGION",
-    ACTION_PATCH: "PATCH",
 }
 ACTION_NAME_TO_ID: Dict[str, int] = {name: idx for idx, name in ACTION_NAMES.items()}
 
-ACTION_NAMES_NO_GLOBAL: Dict[int, str] = {
-    0: "THINK",
-    1: "STOP",
-    2: "REGION",
-    3: "PATCH",
-}
+# Backwards-compatible alias for callers that previously requested a
+# no-global controller.  The canonical controller is already no-global.
+ACTION_NAMES_NO_GLOBAL: Dict[int, str] = dict(ACTION_NAMES)
 ACTION_NAME_TO_ID_NO_GLOBAL: Dict[str, int] = {name: idx for idx, name in ACTION_NAMES_NO_GLOBAL.items()}
 
 

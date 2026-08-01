@@ -10,7 +10,7 @@ from lvar.controller_sft import (
     replay_controller_sft_loss,
     replay_setting_uses_full_context,
 )
-from lvar.utils import ACTION_GLOBAL, ACTION_PATCH, ACTION_REGION, ACTION_STOP, ACTION_THINK
+from lvar.utils import ACTION_PATCH, ACTION_STOP, ACTION_THINK
 
 
 class TinyReplayModel(torch.nn.Module):
@@ -53,7 +53,7 @@ class TinyReplayModel(torch.nn.Module):
     def controller_logits_from_state(self, state, bank, step_idx):
         del state, bank
         self.seen_steps.append(step_idx)
-        type_logits = torch.zeros((1, 5), dtype=torch.float32)
+        type_logits = torch.zeros((1, 3), dtype=torch.float32)
         region_logits = torch.zeros((1, 3), dtype=torch.float32)
         patch_logits = torch.zeros((1, 4), dtype=torch.float32)
         return type_logits, region_logits, patch_logits
@@ -69,7 +69,7 @@ class TinyReplayModel(torch.nn.Module):
 
 class ControllerSFTTests(unittest.TestCase):
     def test_binary_multi_hot_patch_sequence_uses_one_patch_head_target(self):
-        type_logits = torch.zeros((1, 5))
+        type_logits = torch.zeros((1, 3))
         patch_logits = torch.zeros((1, 4))
         actions = [
             {"type": "PATCH", "patch_idx": 0},
@@ -93,7 +93,7 @@ class ControllerSFTTests(unittest.TestCase):
         self.assertTrue(torch.allclose(components["patch_loss"], F.binary_cross_entropy_with_logits(patch_logits, target)))
 
     def test_ordered_patch_sequence_gives_earlier_indices_more_target_mass(self):
-        type_logits = torch.zeros((1, 5))
+        type_logits = torch.zeros((1, 3))
         patch_logits = torch.tensor([[3.0, 0.0, 1.0, 2.0]])
         actions = [
             {"type": "PATCH", "patch_idx": 0},
@@ -235,11 +235,11 @@ class ControllerSFTTests(unittest.TestCase):
         self.assertEqual(actions[1]["patch_idx"], 1)
 
     def test_action_loss_uses_type_only_for_non_indexed_actions(self):
-        type_logits = torch.tensor([[0.0, 2.0, 1.0, -1.0, -2.0]])
+        type_logits = torch.tensor([[0.0, 2.0, 1.0]])
         region_logits = torch.tensor([[10.0, -10.0]])
         patch_logits = torch.tensor([[10.0, -10.0]])
 
-        for action_type, action_id in [("THINK", ACTION_THINK), ("GLOBAL", ACTION_GLOBAL), ("STOP", ACTION_STOP)]:
+        for action_type, action_id in [("THINK", ACTION_THINK), ("STOP", ACTION_STOP)]:
             with self.subTest(action_type=action_type):
                 loss = compute_action_loss(type_logits, region_logits, patch_logits, {"type": action_type})
                 expected = F.cross_entropy(type_logits, torch.tensor([action_id]))
@@ -256,8 +256,8 @@ class ControllerSFTTests(unittest.TestCase):
                 self.assertTrue(torch.allclose(components["type_loss"], expected))
                 self.assertEqual(components["action_type"], action_type)
 
-    def test_patch_and_region_losses_include_index_heads(self):
-        type_logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]])
+    def test_patch_loss_uses_index_head_and_rejects_legacy_region(self):
+        type_logits = torch.tensor([[0.0, 0.0, 0.0]])
         region_logits = torch.tensor([[0.0, 2.0, -1.0]])
         patch_logits = torch.tensor([[1.0, -1.0, 3.0, 0.0]])
 
@@ -268,12 +268,8 @@ class ControllerSFTTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(patch_loss, expected_patch))
 
-        region_loss = compute_action_loss(type_logits, region_logits, patch_logits, {"type": "REGION", "region_idx": 1})
-        expected_region = F.cross_entropy(type_logits, torch.tensor([ACTION_REGION])) + F.cross_entropy(
-            region_logits,
-            torch.tensor([1]),
-        )
-        self.assertTrue(torch.allclose(region_loss, expected_region))
+        with self.assertRaisesRegex(ValueError, "Unsupported Phase 3 action type: REGION"):
+            compute_action_loss(type_logits, region_logits, patch_logits, {"type": "REGION", "region_idx": 1})
 
     def test_replay_skips_noop_without_incrementing_step_and_adds_stop(self):
         model = TinyReplayModel()
@@ -289,17 +285,25 @@ class ControllerSFTTests(unittest.TestCase):
         }
         source_example = {"id": "ex-1", "image": "image", "question": "source question"}
 
-        loss, metrics = replay_controller_sft_loss(model, mined_row, source_example, image_size=280)
+        loss, metrics = replay_controller_sft_loss(
+            model,
+            mined_row,
+            source_example,
+            image_size=280,
+            phase3_v2=True,
+            visual_or_region_min_improvement=0.0,
+            think_min_improvement=0.0,
+        )
 
         self.assertTrue(torch.isfinite(loss))
-        self.assertEqual(model.seen_steps, [0, 1, 2, 3])
-        self.assertEqual(model.applied_actions, ["PATCH", "THINK", "REGION"])
-        self.assertEqual(metrics["num_targets"], 4)
+        self.assertEqual(model.seen_steps, [0, 1, 2])
+        self.assertEqual(model.applied_actions, ["PATCH", "THINK"])
+        self.assertEqual(metrics["num_targets"], 3)
         self.assertEqual(metrics["skipped_noop_decisions"], 1)
         self.assertEqual(metrics["action_counts"]["STOP"], 1)
         self.assertIn("type_loss", metrics["loss_components"])
         self.assertIn("patch_loss", metrics["loss_components"])
-        self.assertIn("region_loss", metrics["loss_components"])
+        self.assertNotIn("region_loss", metrics["loss_components"])
         self.assertIn("PATCH", metrics["action_loss_means"])
         self.assertIn("type_logits_max", metrics["logit_stats"])
         self.assertIn("patch_logits_mean", metrics["logit_stats"])

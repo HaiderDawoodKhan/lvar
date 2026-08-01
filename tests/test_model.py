@@ -7,9 +7,7 @@ import torch.nn.functional as F
 from lvar.controller_sft import set_controller_sft_trainable
 from lvar.qwen_lvar import ControllerHead, QwenLVAR
 from lvar.utils import (
-    ACTION_GLOBAL,
     ACTION_PATCH,
-    ACTION_REGION,
     ACTION_STOP,
     ACTION_THINK,
 )
@@ -284,7 +282,7 @@ class QwenLVARTests(unittest.TestCase):
                 capture["state_hidden"] = state_hidden.detach().clone()
                 capture["step_hidden"] = step_hidden.detach().clone()
                 capture["act_hidden"] = act_hidden
-            type_logits = torch.full((1, 5), -10.0)
+            type_logits = torch.full((1, 3), -10.0)
             type_logits[0, action_id] = 10.0
             region_logits = torch.arange(bank["regions"].size(0), dtype=torch.float32).unsqueeze(0)
             patch_logits = torch.arange(bank["patches"].size(0), dtype=torch.float32).unsqueeze(0)
@@ -515,7 +513,7 @@ class QwenLVARTests(unittest.TestCase):
 
         def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
             capture["state_hidden"] = state_hidden.detach().clone()
-            type_logits = torch.full((1, 5), -10.0)
+            type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_STOP] = 10.0
             region_logits = torch.zeros(1, bank["regions"].size(0))
             patch_logits = torch.zeros(1, bank["patches"].size(0))
@@ -529,7 +527,7 @@ class QwenLVARTests(unittest.TestCase):
         self.assertTrue(torch.allclose(capture["state_hidden"], expected))
 
     def test_forward_reasoning_actions_tokenless(self):
-        for action_id in [ACTION_THINK, ACTION_STOP, ACTION_GLOBAL, ACTION_REGION, ACTION_PATCH]:
+        for action_id in [ACTION_THINK, ACTION_STOP, ACTION_PATCH]:
             with self.subTest(action_id=action_id):
                 state = self.model.build_initial_state(self.prepared)
                 initial_length = state["inputs_embeds"].size(1)
@@ -543,7 +541,7 @@ class QwenLVARTests(unittest.TestCase):
                     self.assertEqual(step_trace["sequence_length_after"], initial_length + 1)
                     appended = updated_state["inputs_embeds"][:, -1, :]
                     self.assertTrue(torch.allclose(appended, initial_final_embed + 0.05))
-                elif action_id in [ACTION_GLOBAL, ACTION_REGION, ACTION_PATCH]:
+                elif action_id == ACTION_PATCH:
                     self.assertEqual(step_trace["sequence_length_after"], initial_length + 1)
                     self.assertTrue(torch.allclose(updated_state["inputs_embeds"][:, -1, :], initial_final_embed))
                     self.assertIsNone(updated_state["latent_pos"])
@@ -559,7 +557,7 @@ class QwenLVARTests(unittest.TestCase):
 
         def forward(state_hidden, step_hidden, bank, act_hidden=None):
             del state_hidden, step_hidden, bank, act_hidden
-            type_logits = torch.tensor([[2.0, 0.0, 0.0, 0.0, 0.0]])
+            type_logits = torch.tensor([[2.0, 0.0, 0.0]])
             region_logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
             patch_logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
             return type_logits, region_logits, patch_logits
@@ -597,7 +595,7 @@ class QwenLVARTests(unittest.TestCase):
 
         self.model.train()
         self.model.max_steps = 1
-        self._set_controller_action(ACTION_GLOBAL)
+        self._set_controller_action(ACTION_PATCH)
         self.model.decode_answer = fake_decode
 
         output = self.model.forward("image", "question", sample_actions=True)
@@ -687,7 +685,7 @@ class QwenLVARTests(unittest.TestCase):
         def forward(state_hidden, step_hidden, bank, act_hidden=None):
             capture["state_hidden"] = state_hidden.detach().clone()
             capture["step_hidden"] = step_hidden.detach().clone()
-            type_logits = torch.full((1, 5), -10.0)
+            type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_STOP] = 10.0
             region_logits = torch.zeros(1, bank["regions"].size(0))
             patch_logits = torch.zeros(1, bank["patches"].size(0))
@@ -742,33 +740,6 @@ class QwenLVARTests(unittest.TestCase):
         self.assertLessEqual(float(region_logits.abs().max()), (1.0 / 0.07) + 1e-5)
         self.assertLessEqual(float(patch_logits.abs().max()), (1.0 / 0.07) + 1e-5)
 
-    def test_region_inserts_raw_patches(self):
-        model = build_model(controller_context_window=1, region_window=2)
-        prepared = model.prepare_inputs("image", "question")
-        projected = model.get_projected_image_tokens(prepared)
-        prepared["projected_image_tokens"] = projected
-        bank = model.build_visual_bank(projected)
-        state = model.build_initial_state(prepared)
-        initial_length = state["inputs_embeds"].size(1)
-
-        def forward(state_hidden, step_hidden, bank, act_hidden=None):
-            type_logits = torch.full((1, 5), -10.0)
-            type_logits[0, ACTION_REGION] = 10.0
-            region_logits = torch.zeros(1, bank["regions"].size(0))
-            region_logits[0, 0] = 10.0
-            patch_logits = torch.zeros(1, bank["patches"].size(0))
-            return type_logits, region_logits, patch_logits
-
-        model.controller.forward = forward
-        updated_state, action_id, should_stop, step_trace = model.forward_reasoning_step(
-            state, bank, 0
-        )
-
-        self.assertEqual(action_id, ACTION_REGION)
-        self.assertEqual(step_trace["sequence_length_after"], initial_length + 4)
-        self.assertIn("raw_regions", bank)
-        self.assertEqual(tuple(bank["raw_regions"].shape), (1, 4, 4))
-
     def test_patch_nucleus_insertion_adds_top_p_set_in_one_controller_step(self):
         model = build_model(
             controller_context_window=1,
@@ -789,7 +760,7 @@ class QwenLVARTests(unittest.TestCase):
 
         def forward(state_hidden, step_hidden, bank, act_hidden=None):
             del state_hidden, step_hidden, act_hidden
-            type_logits = torch.full((1, 5), -10.0)
+            type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_PATCH] = 10.0
             region_logits = torch.zeros(1, bank["regions"].size(0))
             patch_logits = torch.tensor([[3.0, 2.0, -10.0, -10.0]])

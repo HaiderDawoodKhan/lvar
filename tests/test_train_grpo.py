@@ -10,7 +10,7 @@ from lvar.grpo_training import (
     rollout_phase5,
     target_logprob,
 )
-from lvar.utils import ACTION_PATCH, ACTION_REGION, ACTION_STOP
+from lvar.utils import ACTION_PATCH, ACTION_STOP
 from lvar_scripts.train_grpo import (
     asymmetric_baseline_weight,
     build_constant_with_warmup_scheduler,
@@ -22,7 +22,7 @@ from test_model import build_model
 
 
 class GRPOTrainingTests(unittest.TestCase):
-    def test_region_rollout_with_raw_patches_produces_differentiable_policy_loss(self):
+    def test_patch_rollout_produces_differentiable_policy_loss(self):
         model = build_model(controller_context_window=1, max_steps=1, region_window=2)
         model.train()
 
@@ -30,7 +30,7 @@ class GRPOTrainingTests(unittest.TestCase):
             for parameter in model.controller.parameters():
                 parameter.zero_()
             model.controller.type_head.bias.fill_(-10.0)
-            model.controller.type_head.bias[ACTION_REGION] = 10.0
+            model.controller.type_head.bias[ACTION_PATCH] = 10.0
 
         def fake_decode(state, labels=None):
             del labels
@@ -45,10 +45,10 @@ class GRPOTrainingTests(unittest.TestCase):
         model.decode_answer = fake_decode
         rollout = model.forward("image", "question", sample_actions=True)
 
-        self.assertEqual(rollout["trace"][0]["action_id"], ACTION_REGION)
+        self.assertEqual(rollout["trace"][0]["action_id"], ACTION_PATCH)
         self.assertEqual(
             rollout["trace"][0]["sequence_length_after"] - rollout["trace"][0]["sequence_length_before"],
-            4,
+            1,
         )
         self.assertTrue(rollout["action_log_prob_sum"].requires_grad)
 
@@ -146,7 +146,7 @@ class GRPOTrainingTests(unittest.TestCase):
 
         def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
             del state_hidden, step_hidden, act_hidden
-            type_logits = torch.full((1, 5), -10.0)
+            type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_PATCH] = 10.0
             region_logits = torch.zeros(1, bank["regions"].size(0))
             patch_logits = torch.zeros(1, bank["patches"].size(0))
@@ -185,7 +185,7 @@ class GRPOTrainingTests(unittest.TestCase):
 
         def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
             del state_hidden, step_hidden, bank, act_hidden
-            type_logits = torch.full((1, 5), -10.0)
+            type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_STOP] = 10.0
             return type_logits, torch.zeros(1, 1), torch.zeros(1, 4)
 
@@ -210,8 +210,8 @@ class GRPOTrainingTests(unittest.TestCase):
 
         def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
             del state_hidden, step_hidden, bank, act_hidden
-            type_logits = torch.full((1, 5), -10.0)
-            type_logits[0, ACTION_REGION] = 10.0
+            type_logits = torch.full((1, 3), -10.0)
+            type_logits[0, ACTION_PATCH] = 10.0
             return type_logits, torch.zeros(1, 4), torch.zeros(1, 4)
 
         model.controller.forward = controller_forward
@@ -226,7 +226,7 @@ class GRPOTrainingTests(unittest.TestCase):
         rollout = rollout_phase5(model, "image", "question", max_controller_steps=1, temperature=1.0)
 
         self.assertFalse(rollout["stopped"])
-        self.assertEqual(rollout["actions"][0]["type"], "REGION")
+        self.assertEqual(rollout["actions"][0]["type"], "PATCH")
 
     def test_gold_answer_logprob_is_length_normalized_and_finite(self):
         model = build_model(controller_context_window=1)
