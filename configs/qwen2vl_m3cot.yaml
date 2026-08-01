@@ -2,8 +2,9 @@ model:
   model_id: Qwen/Qwen2-VL-2B-Instruct
   device: auto
   dtype: auto
-  # Eight mined decisions plus a terminal STOP prediction.
-  max_steps: 9
+  # Five mined stages can insert up to four tokens each; leave two rollout
+  # steps of margin beyond that 20-token budget.
+  max_steps: 22
   region_window: 2
   max_answer_tokens: 256
   action_selection: sample
@@ -117,14 +118,15 @@ phase3:
   controller_lr: 0.00005
   learning_rate: 0.0005
   weight_decay: 0.01
-  num_epochs: 8
+  num_epochs: 20
   # Save epoch checkpoints every N epochs. Set 0 to keep only the final checkpoint.
-  checkpoint_every: 10
+  checkpoint_every: 4
   max_examples:
   grad_clip_norm: 1.0
   log_every: 100
   image_size: 280
-  controller_max_steps: 32
+  # Must match model.max_steps when loading this controller for inference.
+  controller_max_steps: 22
   full_context_probability: 1.0
   # If false, examples randomly use full context with full_context_probability
   # and otherwise use the coarse/global-mean context.
@@ -135,7 +137,8 @@ phase3:
   replay_setting: global
   decision_block_normalized: true
   visual_block_dropout_p: 0.0
-  multi_hot_patch_labels: true
+  # Each PATCH is supervised and inserted independently.
+  multi_hot_patch_labels: false
   # binary: BCE against 1s at every selected patch; ordered: rank-decayed soft target.
   multi_hot_patch_target_mode: binary
   multi_hot_patch_order_decay: 0.5
