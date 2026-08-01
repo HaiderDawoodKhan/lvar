@@ -144,15 +144,14 @@ class GRPOTrainingTests(unittest.TestCase):
         bank = model.build_visual_bank(projected)
         state = model.build_initial_state(prepared)
 
-        def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
-            del state_hidden, step_hidden, act_hidden
+        def controller_forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
+            del state_hidden, step_hidden, selected_mask, act_hidden
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_PATCH] = 10.0
-            region_logits = torch.zeros(1, bank["regions"].size(0))
-            patch_logits = torch.zeros(1, bank["patches"].size(0))
+            patch_logits = torch.zeros(1, patch_bank.size(1))
             patch_logits[0, 3] = 10.0
             patch_logits[0, 2] = 9.0
-            return type_logits, region_logits, patch_logits
+            return type_logits, patch_logits
 
         model.controller.forward = controller_forward
 
@@ -183,11 +182,11 @@ class GRPOTrainingTests(unittest.TestCase):
             called["coarse"] += 1
             return original_coarse(batch, bank)
 
-        def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
-            del state_hidden, step_hidden, bank, act_hidden
+        def controller_forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
+            del state_hidden, step_hidden, patch_bank, selected_mask, act_hidden
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_STOP] = 10.0
-            return type_logits, torch.zeros(1, 1), torch.zeros(1, 4)
+            return type_logits, torch.zeros(1, 4)
 
         model.build_initial_state = build_full
         model.build_coarse_initial_state = build_coarse
@@ -208,11 +207,11 @@ class GRPOTrainingTests(unittest.TestCase):
     def test_no_stop_rollout_is_marked_for_penalty_reward(self):
         model = build_model(controller_context_window=1, max_steps=1)
 
-        def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
-            del state_hidden, step_hidden, bank, act_hidden
+        def controller_forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
+            del state_hidden, step_hidden, patch_bank, selected_mask, act_hidden
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_PATCH] = 10.0
-            return type_logits, torch.zeros(1, 4), torch.zeros(1, 4)
+            return type_logits, torch.zeros(1, 4)
 
         model.controller.forward = controller_forward
         model.decode_answer = lambda state, labels=None: {

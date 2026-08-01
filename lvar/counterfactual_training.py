@@ -473,8 +473,8 @@ def compute_controller_loss_for_actions(
     controller_step = int(start_step)
     for action in actions:
         name = action_type(action)
-        type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, controller_step)
-        losses.append(compute_action_loss(type_logits, region_logits, patch_logits, action))
+        type_logits, patch_logits = model.controller_logits_from_state(state, bank, controller_step)
+        losses.append(compute_action_loss(type_logits, patch_logits, action))
         action_counts[name] += 1
         with torch.no_grad():
             model.apply_mined_actions(state, bank, [action])

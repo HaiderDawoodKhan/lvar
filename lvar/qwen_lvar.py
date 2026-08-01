@@ -8,10 +8,8 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 from lvar.utils import (
-    ACTION_GLOBAL,
     ACTION_NAMES,
     ACTION_PATCH,
-    ACTION_REGION,
     ACTION_STOP,
     ACTION_THINK,
     extract_tagged_answer,
@@ -33,52 +31,34 @@ except ImportError:  # pragma: no cover - exercised in environments without PEFT
     get_peft_model = None
 
 
-class ControllerHead(nn.Module):
-    """Small policy head that scores action type and fixed visual-unit indices."""
+class ControllerV2(nn.Module):
+    """Candidate-aware PATCH/THINK/STOP policy over a frozen patch bank."""
 
     def __init__(
         self,
         hidden_size: int,
-        num_actions: int,
+        num_actions: int = 3,
         use_control_tokens: bool = False,
         controller_num_states: int = 1,
-        num_regions: int = 25,
-        num_patches: int = 100,
-        index_temperature: Optional[float] = None,
     ) -> None:
         """
         Args:
             hidden_size: Backbone hidden width used by latent/act states.
-            num_actions: Number of high-level controller actions.
+            num_actions: Number of high-level actions (PATCH, THINK, STOP).
             use_control_tokens: Whether latent/act control tokens are enabled.
             controller_num_states: Number of hidden-state positions read by the
                 controller in tokenless mode.
-            num_regions: Fixed number of region classes.
-            num_patches: Fixed number of patch classes.
-            index_temperature: Optional clamp temperature for region/patch
-                logits. When set, index logits are bounded to +/- 1 / T.
-
         Attributes:
-            fuse: MLP combining controller state embeddings.
+            fuse: MLP producing the controller query from recurrent state,
+                step embedding, and a summary of selected patches.
             type_head: Produces logits for PATCH/THINK/STOP only.
-            region_head: Produces logits over fixed region indices.
-            patch_head: Produces logits over fixed patch indices.
+            patch_scorer: Shared query-candidate scorer applied to every patch.
         """
         super().__init__()
+        if num_actions != 3:
+            raise ValueError("ControllerV2 requires exactly three actions: PATCH, THINK, STOP.")
         self.use_control_tokens = use_control_tokens
-        self.num_regions = int(num_regions)
-        self.num_patches = int(num_patches)
-        self.index_logit_limit = None
-        if index_temperature is not None:
-            index_temperature = float(index_temperature)
-            if index_temperature <= 0.0:
-                raise ValueError("index_temperature must be greater than 0.")
-            self.index_logit_limit = 1.0 / index_temperature
-        if self.num_regions <= 0:
-            raise ValueError("num_regions must be greater than 0.")
-        if self.num_patches <= 0:
-            raise ValueError("num_patches must be greater than 0.")
-        input_factor = 3 if use_control_tokens else controller_num_states + 1
+        input_factor = 4 if use_control_tokens else controller_num_states + 2
         self.fuse = nn.Sequential(
             nn.Linear(hidden_size * input_factor, hidden_size),
             nn.GELU(),
@@ -86,32 +66,45 @@ class ControllerHead(nn.Module):
             nn.GELU(),
         )
         self.type_head = nn.Linear(hidden_size, num_actions)
-        self.region_head = nn.Linear(hidden_size, self.num_regions)
-        self.patch_head = nn.Linear(hidden_size, self.num_patches)
+        self.patch_scorer = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
 
     def forward(
         self,
         state_hidden: torch.Tensor,
         step_hidden: torch.Tensor,
-        bank: Dict[str, torch.Tensor],
+        patch_bank: torch.Tensor,
+        selected_mask: torch.Tensor,
         act_hidden: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return action-type logits and index logits for regions and patches."""
-        # Fuse controller context from current reasoning state and recurrent step id.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return action logits and candidate-aware patch logits."""
+        if patch_bank.dim() != 3:
+            raise ValueError("patch_bank must have shape [batch, num_patches, hidden_size].")
+        if selected_mask.shape != patch_bank.shape[:2]:
+            raise ValueError("selected_mask must have shape [batch, num_patches].")
+        selected = selected_mask.to(dtype=patch_bank.dtype).unsqueeze(-1)
+        selected_sum = (patch_bank * selected).sum(dim=1)
+        selected_count = selected.sum(dim=1).clamp_min(1.0)
+        selected_summary = selected_sum / selected_count
         if self.use_control_tokens:
             if act_hidden is None:
                 raise ValueError("act_hidden is required when control tokens are enabled.")
-            controller_inputs = [state_hidden, act_hidden, step_hidden]
+            controller_inputs = [state_hidden, act_hidden, step_hidden, selected_summary]
         else:
-            controller_inputs = [state_hidden, step_hidden]
-        controller_hidden = self.fuse(torch.cat(controller_inputs, dim=-1))
-        type_logits = self.type_head(controller_hidden)
-        region_logits = self.region_head(controller_hidden)
-        patch_logits = self.patch_head(controller_hidden)
-        if self.index_logit_limit is not None:
-            region_logits = region_logits.clamp(-self.index_logit_limit, self.index_logit_limit)
-            patch_logits = patch_logits.clamp(-self.index_logit_limit, self.index_logit_limit)
-        return type_logits, region_logits, patch_logits
+            controller_inputs = [state_hidden, step_hidden, selected_summary]
+        query = self.fuse(torch.cat(controller_inputs, dim=-1))
+        type_logits = self.type_head(query)
+        query_expanded = query.unsqueeze(1).expand(-1, patch_bank.size(1), -1)
+        patch_features = torch.cat([query_expanded, patch_bank, query_expanded * patch_bank], dim=-1)
+        patch_logits = self.patch_scorer(patch_features).squeeze(-1)
+        return type_logits, patch_logits
+
+
+# Keep imports in downstream code stable while exposing the V2 implementation.
+ControllerHead = ControllerV2
 
 
 class QwenLVAR(nn.Module):
@@ -138,7 +131,7 @@ class QwenLVAR(nn.Module):
             image_token_id/eos_token_id: Backbone token ids used in embedding/decode logic.
             latent_token/act_token: Learned recurrent control tokens.
             global_pool/region_pool: Attention scorers for visual-bank pooling.
-            controller: Policy head over action type + region/patch indices.
+            controller: Candidate-aware policy over PATCH/THINK/STOP and image patches.
             step_embedding: Embedding table for recurrent step index.
             _current_image_grid: Cached (H, W) grid read from processor outputs.
         """
@@ -154,11 +147,6 @@ class QwenLVAR(nn.Module):
         self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
         self.action_selection = cfg.get("action_selection", "argmax")
         self.controller_temperature = float(cfg.get("controller_temperature", 1.0))
-        self.controller_index_temperature = cfg.get("controller_index_temperature")
-        if self.controller_index_temperature is not None:
-            self.controller_index_temperature = float(self.controller_index_temperature)
-        self.controller_num_regions = int(cfg.get("controller_num_regions", 25))
-        self.controller_num_patches = int(cfg.get("controller_num_patches", 100))
         self.action_names = normalize_action_names(cfg.get("controller_action_names"))
         if self.action_names != ACTION_NAMES:
             raise ValueError(
@@ -190,12 +178,6 @@ class QwenLVAR(nn.Module):
 
         if self.controller_temperature <= 0.0:
             raise ValueError("controller_temperature must be greater than 0.")
-        if self.controller_index_temperature is not None and self.controller_index_temperature <= 0.0:
-            raise ValueError("controller_index_temperature must be greater than 0.")
-        if self.controller_num_regions <= 0:
-            raise ValueError("controller_num_regions must be greater than 0.")
-        if self.controller_num_patches <= 0:
-            raise ValueError("controller_num_patches must be greater than 0.")
         if self.controller_num_states <= 0:
             raise ValueError("controller_context_window must be greater than 0.")
         if self.controller_max_steps <= 0:
@@ -247,14 +229,11 @@ class QwenLVAR(nn.Module):
         self.global_pool = nn.Linear(self.hidden_size, 1)
         self.region_pool = nn.Linear(self.hidden_size, 1)
         self.controller_state_norm = nn.LayerNorm(self.hidden_size)
-        self.controller = ControllerHead(
+        self.controller = ControllerV2(
             self.hidden_size,
             len(self.action_names),
             use_control_tokens=self.use_control_tokens,
             controller_num_states=self.controller_num_states,
-            num_regions=self.controller_num_regions,
-            num_patches=self.controller_num_patches,
-            index_temperature=self.controller_index_temperature,
         )
         self.step_embedding = nn.Embedding(self.controller_max_steps, self.hidden_size)
 
@@ -1079,21 +1058,13 @@ class QwenLVAR(nn.Module):
     def _controller_head_entropies(
         self,
         type_logits: torch.Tensor,
-        region_logits: torch.Tensor,
         patch_logits: torch.Tensor,
     ) -> Dict[str, float]:
-        """Measure head and hierarchical joint entropy from selection logits."""
+        """Measure the two controller distributions and their joint entropy."""
         action_probs = torch.softmax(type_logits.float(), dim=-1).squeeze(0)
         action_entropy = self._entropy_from_logits(type_logits)
-        region_entropy = self._entropy_from_logits(region_logits)
         patch_entropy = self._entropy_from_logits(patch_logits)
-        region_action_id = self.action_name_to_id.get("REGION")
         patch_action_id = self.action_name_to_id.get("PATCH")
-        region_probability = (
-            float(action_probs[int(region_action_id)].detach().cpu().item())
-            if region_action_id is not None
-            else 0.0
-        )
         patch_probability = (
             float(action_probs[int(patch_action_id)].detach().cpu().item())
             if patch_action_id is not None
@@ -1101,12 +1072,10 @@ class QwenLVAR(nn.Module):
         )
         controller_entropy = (
             action_entropy
-            + region_probability * region_entropy
             + patch_probability * patch_entropy
         )
         return {
             "controller_action_entropy": action_entropy,
-            "controller_region_entropy": region_entropy,
             "controller_patch_entropy": patch_entropy,
             "controller_entropy": float(controller_entropy),
         }
@@ -1115,7 +1084,6 @@ class QwenLVAR(nn.Module):
         """Collect controller-step entropies and aggregate each series."""
         field_to_prefix = {
             "controller_action_entropy": "controller_action_entropy",
-            "controller_region_entropy": "controller_region_entropy",
             "controller_patch_entropy": "controller_patch_entropy",
             "controller_entropy": "controller_entropy",
         }
@@ -1127,6 +1095,12 @@ class QwenLVAR(nn.Module):
             tracking[f"{prefix}_mean"] = summary["mean"]
             tracking[f"{prefix}_median"] = summary["median"]
             tracking[f"{prefix}_max"] = summary["max"]
+        # Retain the historical inference schema without retaining a region
+        # controller head or region-action distribution.
+        tracking["controller_region_entropy_values"] = []
+        tracking["controller_region_entropy_mean"] = None
+        tracking["controller_region_entropy_median"] = None
+        tracking["controller_region_entropy_max"] = None
         return tracking
 
     def _scale_controller_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -1359,6 +1333,8 @@ class QwenLVAR(nn.Module):
             "regions": regions,
             "raw_regions": raw_regions,
             "patches": patch_tokens,
+            # [B, N, D], with an index order matching `patches` exactly.
+            "patch_hidden": patch_tokens.unsqueeze(0),
         }
 
     def build_region_tokens(self, image_tokens: torch.Tensor, pooling: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1431,6 +1407,7 @@ class QwenLVAR(nn.Module):
             "trace_visual_positions": [],
             "trace": [],
             "action_log_probs": [],
+            "selected_patch_indices": [],
             "question": batch.get("question"),
             "sample_actions": False,
         }
@@ -1481,6 +1458,7 @@ class QwenLVAR(nn.Module):
             "trace_visual_positions": [],
             "trace": [],
             "action_log_probs": [],
+            "selected_patch_indices": [],
             "question": batch.get("question"),
             "sample_actions": False,
         }
@@ -1567,8 +1545,8 @@ class QwenLVAR(nn.Module):
         state: Dict[str, Any],
         bank: Dict[str, torch.Tensor],
         step_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return raw controller logits for the current recurrent state."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return raw action and candidate-patch logits for the current state."""
         with torch.no_grad():
             outputs = self.backbone(
                 inputs_embeds=state["inputs_embeds"],
@@ -1581,40 +1559,24 @@ class QwenLVAR(nn.Module):
         final_hidden = self._extract_final_hidden(outputs)
         state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         step_hidden = self._controller_step_hidden(step_idx)
-        type_logits, region_logits, patch_logits = self.controller(
+        type_logits, patch_logits = self.controller(
             state_hidden,
             step_hidden,
-            bank,
+            bank["patch_hidden"],
+            self._selected_patch_mask(state, bank),
             act_hidden=act_hidden,
         )
-        region_logits, patch_logits = self._align_fixed_index_logits(region_logits, patch_logits, bank)
-        return type_logits, region_logits, patch_logits
-
-    def _align_fixed_index_logits(
-        self,
-        region_logits: torch.Tensor,
-        patch_logits: torch.Tensor,
-        bank: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Align fixed classifier outputs to the current visual bank size."""
-        num_regions = bank["regions"].size(0)
-        num_patches = bank["patches"].size(0)
-        return (
-            self._align_index_logits(region_logits, num_regions),
-            self._align_index_logits(patch_logits, num_patches),
-        )
+        return type_logits, patch_logits
 
     @staticmethod
-    def _align_index_logits(logits: torch.Tensor, target_size: int) -> torch.Tensor:
-        current_size = logits.size(-1)
-        if current_size == target_size:
-            return logits
-        if current_size > target_size:
-            return logits[..., :target_size]
-        pad_shape = (*logits.shape[:-1], target_size - current_size)
-        pad_value = torch.finfo(logits.dtype).min
-        padding = torch.full(pad_shape, pad_value, device=logits.device, dtype=logits.dtype)
-        return torch.cat([logits, padding], dim=-1)
+    def _selected_patch_mask(state: Dict[str, Any], bank: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return a batch-aligned mask for candidate patches already inserted."""
+        patch_bank = bank["patch_hidden"]
+        mask = torch.zeros(patch_bank.shape[:2], dtype=torch.bool, device=patch_bank.device)
+        for patch_idx in state.get("selected_patch_indices", []):
+            if isinstance(patch_idx, int) and 0 <= patch_idx < mask.size(1):
+                mask[:, patch_idx] = True
+        return mask
 
     def apply_mined_actions(
         self,
@@ -1648,8 +1610,12 @@ class QwenLVAR(nn.Module):
             elif action_type == "REGION":
                 self._insert_evidence_token(state, bank["raw_regions"][int(action["region_idx"])])
             elif action_type == "PATCH":
-                patch = bank["patches"][int(action["patch_idx"])].unsqueeze(0)
+                patch_idx = int(action["patch_idx"])
+                patch = bank["patches"][patch_idx].unsqueeze(0)
                 self._insert_evidence_token(state, patch)
+                selected = state.setdefault("selected_patch_indices", [])
+                if patch_idx not in selected:
+                    selected.append(patch_idx)
             else:
                 raise ValueError(f"Unsupported mined action type: {action_type}")
         return state
@@ -1687,26 +1653,15 @@ class QwenLVAR(nn.Module):
         state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         # Step embedding gives the controller explicit notion of iteration depth.
         step_hidden = self._controller_step_hidden(step_idx)
-        type_logits, region_logits, patch_logits = self.controller(
+        type_logits, patch_logits = self.controller(
             state_hidden,
             step_hidden,
-            bank,
+            bank["patch_hidden"],
+            self._selected_patch_mask(state, bank),
             act_hidden=act_hidden,
         )
-        region_logits, patch_logits = self._align_fixed_index_logits(region_logits, patch_logits, bank)
         scaled_type_logits = self._scale_controller_logits(type_logits)
-        scaled_region_logits = self._scale_controller_logits(region_logits)
         scaled_patch_logits = self._scale_controller_logits(patch_logits)
-        if self.mask_immediate_repeats and state.get("last_action") == "REGION":
-            last_regions = state.get("last_region_indices")
-            if not isinstance(last_regions, list):
-                last_region = state.get("last_region_index")
-                last_regions = [last_region] if isinstance(last_region, int) else []
-            if last_regions and scaled_region_logits.size(-1) > len(last_regions):
-                scaled_region_logits = scaled_region_logits.clone()
-                for last_region in last_regions:
-                    if 0 <= int(last_region) < scaled_region_logits.size(-1):
-                        scaled_region_logits[:, int(last_region)] = torch.finfo(scaled_region_logits.dtype).min
         if self.mask_immediate_repeats and state.get("last_action") == "PATCH":
             last_patches = state.get("last_patch_indices")
             if not isinstance(last_patches, list):
@@ -1718,11 +1673,9 @@ class QwenLVAR(nn.Module):
                     if 0 <= int(last_patch) < scaled_patch_logits.size(-1):
                         scaled_patch_logits[:, int(last_patch)] = torch.finfo(scaled_patch_logits.dtype).min
         action_probs = self._distribution_to_list(scaled_type_logits)
-        region_probs = self._distribution_to_list(scaled_region_logits)
         patch_probs = self._distribution_to_list(scaled_patch_logits)
         controller_entropies = self._controller_head_entropies(
             scaled_type_logits,
-            scaled_region_logits,
             scaled_patch_logits,
         )
         action_tensor, action_log_prob = self._select_action(
@@ -1734,9 +1687,7 @@ class QwenLVAR(nn.Module):
         should_stop = action_name == "STOP"
 
         # PATCH selects evidence; THINK and STOP do not insert visual tokens.
-        region_index = None
         patch_index = None
-        region_indices: List[int] = []
         patch_indices: List[int] = []
         evidence_tokens: List[torch.Tensor] = []
         if action_name == "PATCH":
@@ -1782,13 +1733,10 @@ class QwenLVAR(nn.Module):
             "action_names": self.action_names,
             "should_stop": should_stop,
             "action_probs": action_probs,
-            "region_probs": region_probs,
             "patch_probs": patch_probs,
             **controller_entropies,
             "controller_temperature": self.controller_temperature,
-            "region_index": region_index,
             "patch_index": patch_index,
-            "region_indices": region_indices,
             "patch_indices": patch_indices,
             "nucleus_insertion_applied": bool(
                 action_name == "PATCH" and self._nucleus_insertion_applies("patch")
@@ -1802,9 +1750,7 @@ class QwenLVAR(nn.Module):
         state["trace"].append(step_trace)
         state["action_log_probs"].append(action_log_prob)
         state["last_action"] = action_name
-        state["last_region_index"] = region_index
         state["last_patch_index"] = patch_index
-        state["last_region_indices"] = region_indices
         state["last_patch_indices"] = patch_indices
         return state, action_id, should_stop, step_trace
 

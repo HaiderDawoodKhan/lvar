@@ -54,9 +54,8 @@ class TinyReplayModel(torch.nn.Module):
         del state, bank
         self.seen_steps.append(step_idx)
         type_logits = torch.zeros((1, 3), dtype=torch.float32)
-        region_logits = torch.zeros((1, 3), dtype=torch.float32)
         patch_logits = torch.zeros((1, 4), dtype=torch.float32)
-        return type_logits, region_logits, patch_logits
+        return type_logits, patch_logits
 
     def apply_mined_actions(self, state, bank, actions):
         del bank
@@ -236,18 +235,16 @@ class ControllerSFTTests(unittest.TestCase):
 
     def test_action_loss_uses_type_only_for_non_indexed_actions(self):
         type_logits = torch.tensor([[0.0, 2.0, 1.0]])
-        region_logits = torch.tensor([[10.0, -10.0]])
         patch_logits = torch.tensor([[10.0, -10.0]])
 
         for action_type, action_id in [("THINK", ACTION_THINK), ("STOP", ACTION_STOP)]:
             with self.subTest(action_type=action_type):
-                loss = compute_action_loss(type_logits, region_logits, patch_logits, {"type": action_type})
+                loss = compute_action_loss(type_logits, patch_logits, {"type": action_type})
                 expected = F.cross_entropy(type_logits, torch.tensor([action_id]))
                 self.assertTrue(torch.allclose(loss, expected))
 
                 component_loss, components = compute_action_loss(
                     type_logits,
-                    region_logits,
                     patch_logits,
                     {"type": action_type},
                     return_components=True,
@@ -258,10 +255,9 @@ class ControllerSFTTests(unittest.TestCase):
 
     def test_patch_loss_uses_index_head_and_rejects_legacy_region(self):
         type_logits = torch.tensor([[0.0, 0.0, 0.0]])
-        region_logits = torch.tensor([[0.0, 2.0, -1.0]])
         patch_logits = torch.tensor([[1.0, -1.0, 3.0, 0.0]])
 
-        patch_loss = compute_action_loss(type_logits, region_logits, patch_logits, {"type": "PATCH", "patch_idx": 2})
+        patch_loss = compute_action_loss(type_logits, patch_logits, {"type": "PATCH", "patch_idx": 2})
         expected_patch = F.cross_entropy(type_logits, torch.tensor([ACTION_PATCH])) + F.cross_entropy(
             patch_logits,
             torch.tensor([2]),
@@ -269,7 +265,7 @@ class ControllerSFTTests(unittest.TestCase):
         self.assertTrue(torch.allclose(patch_loss, expected_patch))
 
         with self.assertRaisesRegex(ValueError, "Unsupported Phase 3 action type: REGION"):
-            compute_action_loss(type_logits, region_logits, patch_logits, {"type": "REGION", "region_idx": 1})
+            compute_action_loss(type_logits, patch_logits, {"type": "REGION", "region_idx": 1})
 
     def test_replay_skips_noop_without_incrementing_step_and_adds_stop(self):
         model = TinyReplayModel()

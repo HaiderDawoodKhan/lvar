@@ -611,21 +611,9 @@ def measure_forced_controller_step(
     step_idx: int,
 ) -> Dict[str, Any]:
     """Measure current controller uncertainty before forcing a replay action."""
-    type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
+    type_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
     scaled_type_logits = model._scale_controller_logits(type_logits)
-    scaled_region_logits = model._scale_controller_logits(region_logits)
     scaled_patch_logits = model._scale_controller_logits(patch_logits)
-
-    if model.mask_immediate_repeats and state.get("last_action") == "REGION":
-        last_regions = state.get("last_region_indices")
-        if not isinstance(last_regions, list):
-            last_region = state.get("last_region_index")
-            last_regions = [last_region] if isinstance(last_region, int) else []
-        if last_regions and scaled_region_logits.size(-1) > len(last_regions):
-            scaled_region_logits = scaled_region_logits.clone()
-            for last_region in last_regions:
-                if 0 <= int(last_region) < scaled_region_logits.size(-1):
-                    scaled_region_logits[:, int(last_region)] = torch.finfo(scaled_region_logits.dtype).min
 
     if model.mask_immediate_repeats and state.get("last_action") == "PATCH":
         last_patches = state.get("last_patch_indices")
@@ -644,11 +632,9 @@ def measure_forced_controller_step(
         "action_id": action_id,
         "action_names": model.action_names,
         "action_probs": model._distribution_to_list(scaled_type_logits),
-        "region_probs": model._distribution_to_list(scaled_region_logits),
         "patch_probs": model._distribution_to_list(scaled_patch_logits),
         **model._controller_head_entropies(
             scaled_type_logits,
-            scaled_region_logits,
             scaled_patch_logits,
         ),
         "controller_temperature": model.controller_temperature,
@@ -656,11 +642,6 @@ def measure_forced_controller_step(
     if action_id is not None:
         action_log_probs = torch.log_softmax(scaled_type_logits.float(), dim=-1)
         metrics["forced_action_log_prob"] = float(action_log_probs[:, int(action_id)].detach().cpu().item())
-    if action_type == "REGION" and action.get("region_idx") is not None:
-        region_idx = int(action["region_idx"])
-        if 0 <= region_idx < scaled_region_logits.size(-1):
-            region_log_probs = torch.log_softmax(scaled_region_logits.float(), dim=-1)
-            metrics["forced_index_log_prob"] = float(region_log_probs[:, region_idx].detach().cpu().item())
     if action_type == "PATCH" and action.get("patch_idx") is not None:
         patch_idx = int(action["patch_idx"])
         if 0 <= patch_idx < scaled_patch_logits.size(-1):

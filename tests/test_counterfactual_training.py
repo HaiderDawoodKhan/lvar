@@ -128,8 +128,7 @@ class TinyPhase4Model(torch.nn.Module):
         hidden = torch.zeros(1, 3)
         type_logits = self.controller(hidden)
         patch_logits = torch.zeros(1, bank["patches"].size(0))
-        region_logits = torch.zeros(1, bank["raw_regions"].size(0))
-        return type_logits, region_logits, patch_logits
+        return type_logits, patch_logits
 
 
 class CounterfactualTrainingTests(unittest.TestCase):

@@ -13,18 +13,10 @@ from lvar.counterfactual_training import (
     build_negative_actions,
     differentiable_state_ce,
 )
-from lvar.utils import (
-    ACTION_GLOBAL,
-    ACTION_NAMES,
-    ACTION_PATCH,
-    ACTION_REGION,
-    ACTION_STOP,
-    ACTION_THINK,
-    normalize_action_names,
-)
+from lvar.utils import ACTION_NAMES, ACTION_PATCH, ACTION_STOP, ACTION_THINK, normalize_action_names
 
 
-VISUAL_ACTIONS = {"GLOBAL", "REGION", "PATCH"}
+VISUAL_ACTIONS = {"PATCH"}
 
 
 def normalize_group_rewards(rewards: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
@@ -219,15 +211,12 @@ def _sample_from_logits(logits: torch.Tensor, sample: bool = True) -> Tuple[int,
 def _action_from_selection(
     action_id: int,
     action_names: Optional[Dict[int, str]] = None,
-    region_idx: Optional[int] = None,
     patch_idx: Optional[int] = None,
 ) -> Dict[str, Any]:
     names = action_names or ACTION_NAMES
     action_name = names[action_id]
     action = {"type": action_name}
-    if action_name == "REGION":
-        action["region_idx"] = int(region_idx)
-    elif action_name == "PATCH":
+    if action_name == "PATCH":
         action["patch_idx"] = int(patch_idx)
     return action
 
@@ -261,7 +250,7 @@ def select_controller_action(
     sample: bool = True,
 ) -> Tuple[Dict[str, Any], torch.Tensor, Dict[str, torch.Tensor]]:
     """Select one controller action with optional patch masking."""
-    type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
+    type_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
     type_logits = _masked_stop_logits(
         type_logits,
         model,
@@ -271,21 +260,15 @@ def select_controller_action(
         min_visual_actions_before_stop=min_visual_actions_before_stop,
     )
     scaled_type = _scaled_logits(type_logits, temperature)
-    scaled_region = _scaled_logits(region_logits, temperature)
     scaled_patch = _scaled_logits(_masked_patch_logits(patch_logits, selected_patches), temperature)
     action_id, log_prob = _sample_from_logits(scaled_type, sample=sample)
     action_name = getattr(model, "action_names", ACTION_NAMES)[action_id]
-    region_idx = None
     patch_idx = None
-    if action_name == "REGION":
-        region_idx, region_log_prob = _sample_from_logits(scaled_region, sample=sample)
-        log_prob = log_prob + region_log_prob
-    elif action_name == "PATCH":
+    if action_name == "PATCH":
         patch_idx, patch_log_prob = _sample_from_logits(scaled_patch, sample=sample)
         log_prob = log_prob + patch_log_prob
-    return _action_from_selection(action_id, getattr(model, "action_names", ACTION_NAMES), region_idx, patch_idx), log_prob, {
+    return _action_from_selection(action_id, getattr(model, "action_names", ACTION_NAMES), patch_idx), log_prob, {
         "type_logits": scaled_type,
-        "region_logits": scaled_region,
         "patch_logits": scaled_patch,
     }
 
@@ -330,9 +313,6 @@ def rollout_phase5(
             selected_patches.add(int(action["patch_idx"]))
             selected_visual_actions.append(copy.deepcopy(action))
             selected_visual_count += 1
-        elif action_type in {"REGION", "GLOBAL"}:
-            selected_visual_actions.append(copy.deepcopy(action))
-            selected_visual_count += 1
         if action_type == "STOP":
             stopped = True
             break
@@ -371,7 +351,7 @@ def action_log_prob_for_replay(
     min_visual_actions_before_stop: int = 0,
 ) -> torch.Tensor:
     """Compute current log-prob for a stored action under replay state."""
-    type_logits, region_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
+    type_logits, patch_logits = model.controller_logits_from_state(state, bank, step_idx)
     type_logits = _masked_stop_logits(
         type_logits,
         model,
@@ -386,11 +366,7 @@ def action_log_prob_for_replay(
     action_tensor = torch.tensor([action_id], device=scaled_type.device, dtype=torch.long)
     log_prob = Categorical(logits=scaled_type).log_prob(action_tensor).squeeze(0)
     action_name = str(action["type"]).upper()
-    if action_name == "REGION":
-        scaled_region = _scaled_logits(region_logits, temperature)
-        region_tensor = torch.tensor([int(action["region_idx"])], device=scaled_region.device, dtype=torch.long)
-        log_prob = log_prob + Categorical(logits=scaled_region).log_prob(region_tensor).squeeze(0)
-    elif action_name == "PATCH":
+    if action_name == "PATCH":
         scaled_patch = _scaled_logits(_masked_patch_logits(patch_logits, selected_patches), temperature)
         patch_tensor = torch.tensor([int(action["patch_idx"])], device=scaled_patch.device, dtype=torch.long)
         log_prob = log_prob + Categorical(logits=scaled_patch).log_prob(patch_tensor).squeeze(0)
@@ -430,8 +406,6 @@ def recompute_action_log_probs(
         action_type = str(action["type"]).upper()
         if action_type == "PATCH":
             selected_patches.add(int(action["patch_idx"]))
-            selected_visual_count += 1
-        elif action_type in {"REGION", "GLOBAL"}:
             selected_visual_count += 1
         if action_type == "STOP":
             break

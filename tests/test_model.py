@@ -277,16 +277,16 @@ class QwenLVARTests(unittest.TestCase):
         self.bank = self.model.build_visual_bank(projected)
 
     def _set_controller_action(self, action_id, capture=None):
-        def forward(state_hidden, step_hidden, bank, act_hidden=None):
+        def forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
             if capture is not None:
                 capture["state_hidden"] = state_hidden.detach().clone()
                 capture["step_hidden"] = step_hidden.detach().clone()
                 capture["act_hidden"] = act_hidden
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, action_id] = 10.0
-            region_logits = torch.arange(bank["regions"].size(0), dtype=torch.float32).unsqueeze(0)
-            patch_logits = torch.arange(bank["patches"].size(0), dtype=torch.float32).unsqueeze(0)
-            return type_logits, region_logits, patch_logits
+            del selected_mask
+            patch_logits = torch.arange(patch_bank.size(1), dtype=torch.float32).unsqueeze(0)
+            return type_logits, patch_logits
 
         self.model.controller.forward = forward
 
@@ -368,6 +368,8 @@ class QwenLVARTests(unittest.TestCase):
 
     def test_build_visual_bank_shapes(self):
         self.assertEqual(tuple(self.bank["patches"].shape), (4, 4))
+        self.assertEqual(tuple(self.bank["patch_hidden"].shape), (1, 4, 4))
+        self.assertTrue(torch.equal(self.bank["patch_hidden"].squeeze(0), self.bank["patches"]))
         self.assertEqual(tuple(self.bank["regions"].shape), (4, 4))
         self.assertEqual(tuple(self.bank["raw_regions"].shape), (4, 1, 4))
         self.assertEqual(tuple(self.bank["global"].shape), (1, 4))
@@ -511,13 +513,13 @@ class QwenLVARTests(unittest.TestCase):
         state = model.build_initial_state(prepared)
         capture = {}
 
-        def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
+        def controller_forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
             capture["state_hidden"] = state_hidden.detach().clone()
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_STOP] = 10.0
-            region_logits = torch.zeros(1, bank["regions"].size(0))
-            patch_logits = torch.zeros(1, bank["patches"].size(0))
-            return type_logits, region_logits, patch_logits
+            del selected_mask
+            patch_logits = torch.zeros(1, patch_bank.size(1))
+            return type_logits, patch_logits
 
         model.controller.forward = controller_forward
         model.forward_reasoning_step(state, bank, 0)
@@ -555,12 +557,11 @@ class QwenLVARTests(unittest.TestCase):
         cold_model = build_model(controller_temperature=0.5)
         hot_model = build_model(controller_temperature=2.0)
 
-        def forward(state_hidden, step_hidden, bank, act_hidden=None):
-            del state_hidden, step_hidden, bank, act_hidden
+        def forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
+            del state_hidden, step_hidden, selected_mask, act_hidden
             type_logits = torch.tensor([[2.0, 0.0, 0.0]])
-            region_logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-            patch_logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-            return type_logits, region_logits, patch_logits
+            patch_logits = torch.zeros(1, patch_bank.size(1))
+            return type_logits, patch_logits
 
         cold_model.controller.forward = forward
         hot_model.controller.forward = forward
@@ -682,14 +683,14 @@ class QwenLVARTests(unittest.TestCase):
         state = model.build_initial_state(prepared)
         capture = {}
 
-        def forward(state_hidden, step_hidden, bank, act_hidden=None):
+        def forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
             capture["state_hidden"] = state_hidden.detach().clone()
             capture["step_hidden"] = step_hidden.detach().clone()
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_STOP] = 10.0
-            region_logits = torch.zeros(1, bank["regions"].size(0))
-            patch_logits = torch.zeros(1, bank["patches"].size(0))
-            return type_logits, region_logits, patch_logits
+            del selected_mask
+            patch_logits = torch.zeros(1, patch_bank.size(1))
+            return type_logits, patch_logits
 
         model.controller.forward = forward
         model.forward_reasoning_step(state, bank, 0)
@@ -719,32 +720,33 @@ class QwenLVARTests(unittest.TestCase):
         self.assertFalse(any(name.startswith("region_pool.") for name in trainable_names))
         self.assertFalse(any(name.startswith("backbone.") for name in trainable_names))
 
-    def test_controller_index_logits_are_normalized_and_finite(self):
-        head = ControllerHead(
-            hidden_size=4,
-            num_actions=5,
-            controller_num_states=1,
-            index_temperature=0.07,
-        )
+    def test_controller_v2_scores_candidate_patches_and_uses_selected_summary(self):
+        torch.manual_seed(0)
+        head = ControllerHead(hidden_size=4, controller_num_states=1)
         state_hidden = torch.randn(1, 4) * 1000.0
         step_hidden = torch.randn(1, 4) * 1000.0
-        bank = {
-            "regions": torch.randn(3, 4) * 1000.0,
-            "patches": torch.randn(4, 4) * 1000.0,
-        }
+        patch_bank = torch.randn(1, 4, 4) * 1000.0
+        no_selected = torch.zeros(1, 4, dtype=torch.bool)
+        first_selected = no_selected.clone()
+        first_selected[0, 0] = True
 
-        _, region_logits, patch_logits = head(state_hidden, step_hidden, bank)
+        type_logits, patch_logits = head(state_hidden, step_hidden, patch_bank, no_selected)
+        selected_type_logits, selected_patch_logits = head(
+            state_hidden, step_hidden, patch_bank, first_selected
+        )
 
-        self.assertTrue(torch.isfinite(region_logits).all())
+        self.assertEqual(tuple(type_logits.shape), (1, 3))
+        self.assertEqual(tuple(patch_logits.shape), (1, 4))
+        self.assertFalse(hasattr(head, "region_head"))
+        self.assertFalse(hasattr(head, "patch_head"))
+        self.assertTrue(torch.isfinite(type_logits).all())
         self.assertTrue(torch.isfinite(patch_logits).all())
-        self.assertLessEqual(float(region_logits.abs().max()), (1.0 / 0.07) + 1e-5)
-        self.assertLessEqual(float(patch_logits.abs().max()), (1.0 / 0.07) + 1e-5)
+        self.assertFalse(torch.allclose(type_logits, selected_type_logits))
+        self.assertFalse(torch.allclose(patch_logits, selected_patch_logits))
 
     def test_patch_nucleus_insertion_adds_top_p_set_in_one_controller_step(self):
         model = build_model(
             controller_context_window=1,
-            controller_num_regions=4,
-            controller_num_patches=4,
             nucleus_insertion_enabled=True,
             nucleus_insertion_scope="patch",
             nucleus_insertion_top_p=0.8,
@@ -758,13 +760,13 @@ class QwenLVARTests(unittest.TestCase):
         state = model.build_initial_state(prepared)
         initial_length = state["inputs_embeds"].size(1)
 
-        def forward(state_hidden, step_hidden, bank, act_hidden=None):
-            del state_hidden, step_hidden, act_hidden
+        def forward(state_hidden, step_hidden, patch_bank, selected_mask, act_hidden=None):
+            del state_hidden, step_hidden, selected_mask, act_hidden
             type_logits = torch.full((1, 3), -10.0)
             type_logits[0, ACTION_PATCH] = 10.0
-            region_logits = torch.zeros(1, bank["regions"].size(0))
             patch_logits = torch.tensor([[3.0, 2.0, -10.0, -10.0]])
-            return type_logits, region_logits, patch_logits
+            self.assertEqual(patch_bank.size(1), patch_logits.size(1))
+            return type_logits, patch_logits
 
         model.controller.forward = forward
         updated_state, action_id, should_stop, step_trace = model.forward_reasoning_step(state, bank, 0)

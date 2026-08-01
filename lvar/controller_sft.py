@@ -94,7 +94,6 @@ def action_type(action: Dict[str, Any], action_name_to_id: Optional[Dict[str, in
 
 def compute_action_loss(
     type_logits: torch.Tensor,
-    region_logits: torch.Tensor,
     patch_logits: torch.Tensor,
     action: Dict[str, Any],
     return_components: bool = False,
@@ -124,7 +123,6 @@ def compute_action_loss(
             "type_loss": type_loss,
             "raw_type_loss": raw_type_loss,
             "patch_loss": patch_loss,
-            "region_loss": torch.zeros((), device=device, dtype=type_loss.dtype),
         }
     return loss
 
@@ -176,7 +174,6 @@ def compute_patch_sequence_loss(
         "type_loss": type_loss,
         "raw_type_loss": raw_type_loss,
         "patch_loss": patch_loss,
-        "region_loss": zero,
         "patch_target_mode": mode,
     }
 
@@ -443,22 +440,20 @@ def replay_controller_sft_loss(
 
     def record_step_metrics(
         type_logits: torch.Tensor,
-        region_logits: torch.Tensor,
         patch_logits: torch.Tensor,
         components: Dict[str, torch.Tensor | str],
     ) -> None:
         _update_logit_stats("type_logits", type_logits, logit_stat_totals, logit_stat_counts)
-        _update_logit_stats("region_logits", region_logits, logit_stat_totals, logit_stat_counts)
         _update_logit_stats("patch_logits", patch_logits, logit_stat_totals, logit_stat_counts)
         action_name = str(components["action_type"])
         total_value = float(components["total_loss"].detach().item())  # type: ignore[union-attr]
         action_loss_totals[action_name] = action_loss_totals.get(action_name, 0.0) + total_value
         action_loss_counts[action_name] = action_loss_counts.get(action_name, 0) + 1
-        for key in ("total_loss", "type_loss", "raw_type_loss", "patch_loss", "region_loss"):
+        for key in ("total_loss", "type_loss", "raw_type_loss", "patch_loss"):
             value = components[key]
             if not isinstance(value, torch.Tensor):
                 continue
-            if key in {"patch_loss", "region_loss"} and float(value.detach().item()) == 0.0:
+            if key == "patch_loss" and float(value.detach().item()) == 0.0:
                 continue
             component_loss_totals[key] = component_loss_totals.get(key, 0.0) + float(value.detach().item())
             component_loss_counts[key] = component_loss_counts.get(key, 0) + 1
@@ -511,7 +506,7 @@ def replay_controller_sft_loss(
                     patch_run.append(actions[run_cursor])
                     run_cursor += 1
             if len(patch_run) > 1:
-                type_logits, region_logits, patch_logits = model.controller_logits_from_state(
+                type_logits, patch_logits = model.controller_logits_from_state(
                     state,
                     bank,
                     controller_step,
@@ -530,21 +525,20 @@ def replay_controller_sft_loss(
                 primitive_target_count += len(patch_run)
                 multi_hot_patch_blocks += 1
                 multi_hot_patch_indices += len(patch_run)
-                record_step_metrics(type_logits, region_logits, patch_logits, components)
+                record_step_metrics(type_logits, patch_logits, components)
                 with torch.no_grad():
                     model.apply_mined_actions(state, bank, patch_run)
                 controller_step += 1
                 action_cursor += len(patch_run)
                 continue
 
-            type_logits, region_logits, patch_logits = model.controller_logits_from_state(
+            type_logits, patch_logits = model.controller_logits_from_state(
                 state,
                 bank,
                 controller_step,
             )
             loss, components = compute_action_loss(
                 type_logits,
-                region_logits,
                 patch_logits,
                 action,
                 return_components=True,
@@ -554,7 +548,7 @@ def replay_controller_sft_loss(
             block_losses.append(loss)
             primitive_target_count += 1
             action_counts[str(components["action_type"])] += 1
-            record_step_metrics(type_logits, region_logits, patch_logits, components)
+            record_step_metrics(type_logits, patch_logits, components)
             if str(components["action_type"]) != "STOP":
                 with torch.no_grad():
                     model.apply_mined_actions(state, bank, [action])

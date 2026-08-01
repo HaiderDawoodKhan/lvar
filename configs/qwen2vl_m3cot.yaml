@@ -12,14 +12,11 @@ model:
   # REGION and GLOBAL choices are filtered before SFT supervision.
   controller_action_names: [PATCH, THINK, STOP]
   controller_temperature: 1.0
-  controller_index_temperature: 0.07
   nucleus_insertion_enabled: false
   # Only PATCH is selectable by the controller.
   nucleus_insertion_scope: patch
   nucleus_insertion_top_p: 0.9
   nucleus_insertion_max_indices: 4
-  controller_num_regions: 25
-  controller_num_patches: 100
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
