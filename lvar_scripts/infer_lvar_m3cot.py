@@ -124,6 +124,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--vlm-path", default=None)
+    parser.add_argument(
+        "--no-vlm-checkpoint",
+        action="store_true",
+        help="Do not load the optional VLM LoRA checkpoint from the config.",
+    )
     parser.add_argument("--controller-path", default=None)
     parser.add_argument("--use-coarse-context", action="store_true", default=False)
     parser.add_argument(
@@ -193,6 +198,8 @@ def main() -> None:
         "phase4_vlm_checkpoint_path",
         config.get("phase5", {}).get("phase4_vlm_checkpoint_path", ""),
     )
+    if args.no_vlm_checkpoint:
+        phase4_vlm_checkpoint_path = ""
     if phase4_vlm_checkpoint_path:
         loaded = load_vlm_lora_checkpoint(model, phase4_vlm_checkpoint_path)
         if loaded:
