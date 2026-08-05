@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from lvar.controller_sft import set_controller_sft_trainable
-from lvar.qwen_lvar import ControllerHead, QwenLVAR
+from lvar.qwen_lvar import ControllerHead, QwenLVAR, TransformerController
 from lvar.utils import (
     ACTION_PATCH,
     ACTION_STOP,
@@ -743,6 +743,79 @@ class QwenLVARTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(patch_logits).all())
         self.assertFalse(torch.allclose(type_logits, selected_type_logits))
         self.assertFalse(torch.allclose(patch_logits, selected_patch_logits))
+
+    def test_transformer_controller_attends_full_hidden_context_and_patch_bank(self):
+        torch.manual_seed(0)
+        controller = TransformerController(
+            hidden_size=4,
+            controller_num_states=1,
+            num_layers=1,
+            num_heads=2,
+            dropout=0.0,
+        )
+        state_hidden = torch.randn(1, 4)
+        step_hidden = torch.randn(1, 4)
+        context_hidden = torch.randn(1, 6, 4)
+        context_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.long)
+        patch_bank = torch.randn(1, 4, 4)
+        no_selected = torch.zeros(1, 4, dtype=torch.bool)
+        first_selected = no_selected.clone()
+        first_selected[0, 0] = True
+
+        type_logits, patch_logits = controller(
+            state_hidden,
+            step_hidden,
+            patch_bank,
+            no_selected,
+            context_hidden=context_hidden,
+            context_attention_mask=context_mask,
+        )
+        selected_type_logits, selected_patch_logits = controller(
+            state_hidden,
+            step_hidden,
+            patch_bank,
+            first_selected,
+            context_hidden=context_hidden,
+            context_attention_mask=context_mask,
+        )
+        changed_context = context_hidden.clone()
+        changed_context[:, 0, 0] = changed_context[:, 0, 0] + 5.0
+        changed_context_type_logits, changed_context_patch_logits = controller(
+            state_hidden,
+            step_hidden,
+            patch_bank,
+            no_selected,
+            context_hidden=changed_context,
+            context_attention_mask=context_mask,
+        )
+
+        self.assertEqual(tuple(type_logits.shape), (1, 3))
+        self.assertEqual(tuple(patch_logits.shape), (1, 4))
+        self.assertTrue(torch.isfinite(type_logits).all())
+        self.assertTrue(torch.isfinite(patch_logits).all())
+        self.assertFalse(torch.allclose(type_logits, selected_type_logits))
+        self.assertFalse(torch.allclose(patch_logits, selected_patch_logits))
+        self.assertFalse(torch.allclose(type_logits, changed_context_type_logits))
+        self.assertFalse(torch.allclose(patch_logits, changed_context_patch_logits))
+
+    def test_transformer_controller_architecture_runs_through_qwen_wrapper(self):
+        model = build_model(
+            controller_architecture="transformer",
+            controller_transformer_layers=1,
+            controller_transformer_heads=2,
+            controller_transformer_dropout=0.0,
+        )
+        self.assertIsInstance(self.model.controller, ControllerHead)
+        self.assertIsInstance(model.controller, TransformerController)
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        bank = model.build_visual_bank(projected)
+        state = model.build_initial_state(prepared)
+
+        type_logits, patch_logits = model.controller_logits_from_state(state, bank, 0)
+
+        self.assertEqual(tuple(type_logits.shape), (1, 3))
+        self.assertEqual(tuple(patch_logits.shape), (1, 4))
 
     def test_patch_nucleus_insertion_adds_top_p_set_in_one_controller_step(self):
         model = build_model(

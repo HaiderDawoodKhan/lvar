@@ -1,9 +1,12 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
 from lvar.grpo_training import (
     clipped_grpo_loss,
+    load_controller_checkpoint,
     normalize_group_rewards,
     select_controller_action,
     set_phase5_trainable,
@@ -22,6 +25,24 @@ from test_model import build_model
 
 
 class GRPOTrainingTests(unittest.TestCase):
+    def test_controller_checkpoint_rejects_architecture_mismatch(self):
+        model = build_model(
+            controller_architecture="transformer",
+            controller_transformer_layers=1,
+            controller_transformer_heads=2,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "mlp_controller.pt"
+            torch.save(
+                {
+                    "state_dict": {},
+                    "metadata": {"controller_architecture": "mlp"},
+                },
+                checkpoint_path,
+            )
+            with self.assertRaisesRegex(ValueError, "controller_architecture"):
+                load_controller_checkpoint(model, checkpoint_path)
+
     def test_patch_rollout_produces_differentiable_policy_loss(self):
         model = build_model(controller_context_window=1, max_steps=1, region_window=2)
         model.train()

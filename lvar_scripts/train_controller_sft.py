@@ -92,6 +92,13 @@ def main() -> None:
         metavar="KEY=VALUE",
         help="Override a phase3_v2 config value. Can be repeated; values are parsed as YAML scalars.",
     )
+    parser.add_argument(
+        "--model-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a model config value. Can be repeated; values are parsed as YAML scalars.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -102,6 +109,7 @@ def main() -> None:
     phase3_v2_cfg.update(parse_config_overrides(args.phase3_v2_override))
     dataset_cfg = config["dataset"]
     model_cfg = apply_model_loading_overrides(config["model"], args)
+    model_cfg.update(parse_config_overrides(args.model_override))
 
     if "controller_max_steps" in phase3_cfg:
         model_cfg["controller_max_steps"] = int(phase3_cfg["controller_max_steps"])
@@ -349,6 +357,7 @@ def main() -> None:
                 "transform_totals": dict(transform_totals),
                 "skipped_block_totals": dict(skipped_block_totals),
                 "action_names": model.action_names,
+                "controller_architecture": model.controller_architecture,
                 "controller_context_window": model.controller_num_states,
                 "controller_max_steps": model.step_embedding.num_embeddings,
                 "seed": seed,
@@ -398,6 +407,7 @@ def main() -> None:
         "transform_totals": dict(transform_totals),
         "skipped_block_totals": dict(skipped_block_totals),
         "action_names": model.action_names,
+        "controller_architecture": model.controller_architecture,
         "controller_context_window": model.controller_num_states,
         "controller_max_steps": model.step_embedding.num_embeddings,
         "seed": seed,

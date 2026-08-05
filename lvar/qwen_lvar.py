@@ -107,6 +107,126 @@ class ControllerV2(nn.Module):
 ControllerHead = ControllerV2
 
 
+class TransformerController(nn.Module):
+    """Cross-attention controller over the full VLM state sequence and patch bank."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_actions: int = 3,
+        use_control_tokens: bool = False,
+        controller_num_states: int = 1,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        feedforward_multiplier: int = 4,
+    ) -> None:
+        super().__init__()
+        if num_actions != 3:
+            raise ValueError("TransformerController requires exactly three actions: PATCH, THINK, STOP.")
+        if num_layers <= 0:
+            raise ValueError("controller transformer num_layers must be positive.")
+        if num_heads <= 0 or hidden_size % num_heads != 0:
+            raise ValueError("controller transformer num_heads must divide hidden_size.")
+        if feedforward_multiplier <= 0:
+            raise ValueError("controller transformer feedforward_multiplier must be positive.")
+
+        self.use_control_tokens = use_control_tokens
+        state_width = hidden_size if use_control_tokens else hidden_size * controller_num_states
+        self.state_adapter = nn.Linear(state_width, hidden_size)
+        self.query_role_embeddings = nn.Parameter(torch.randn(4, hidden_size) * 0.02)
+        self.context_type_embedding = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.patch_type_embedding = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.selected_patch_embedding = nn.Embedding(2, hidden_size)
+        self.context_norm = nn.LayerNorm(hidden_size)
+        self.patch_norm = nn.LayerNorm(hidden_size)
+        self.query_norm = nn.LayerNorm(hidden_size)
+        self.blocks = nn.ModuleList(
+            [
+                nn.TransformerDecoderLayer(
+                    d_model=hidden_size,
+                    nhead=num_heads,
+                    dim_feedforward=hidden_size * feedforward_multiplier,
+                    dropout=dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.output_norm = nn.LayerNorm(hidden_size)
+        self.type_head = nn.Linear(hidden_size, num_actions)
+        self.patch_scorer = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(
+        self,
+        state_hidden: torch.Tensor,
+        step_hidden: torch.Tensor,
+        patch_bank: torch.Tensor,
+        selected_mask: torch.Tensor,
+        act_hidden: Optional[torch.Tensor] = None,
+        context_hidden: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Attend controller queries to all current VLM states and patch candidates."""
+        if context_hidden is None or context_hidden.dim() != 3:
+            raise ValueError("context_hidden must have shape [batch, sequence_length, hidden_size].")
+        if patch_bank.dim() != 3:
+            raise ValueError("patch_bank must have shape [batch, num_patches, hidden_size].")
+        if context_hidden.size(0) != patch_bank.size(0):
+            raise ValueError("context_hidden and patch_bank must have the same batch size.")
+        if context_hidden.size(-1) != patch_bank.size(-1):
+            raise ValueError("context_hidden and patch_bank must have the same hidden size.")
+        if selected_mask.shape != patch_bank.shape[:2]:
+            raise ValueError("selected_mask must have shape [batch, num_patches].")
+        if context_attention_mask is not None and context_attention_mask.shape != context_hidden.shape[:2]:
+            raise ValueError("context_attention_mask must have shape [batch, sequence_length].")
+
+        selected_mask = selected_mask.to(device=patch_bank.device, dtype=torch.bool)
+        selected = selected_mask.to(dtype=patch_bank.dtype).unsqueeze(-1)
+        selected_summary = (patch_bank * selected).sum(dim=1) / selected.sum(dim=1).clamp_min(1.0)
+        state_token = self.state_adapter(state_hidden)
+        if self.use_control_tokens:
+            if act_hidden is None:
+                raise ValueError("act_hidden is required when control tokens are enabled.")
+            query_tokens = [state_token, act_hidden, step_hidden, selected_summary]
+        else:
+            query_tokens = [state_token, step_hidden, selected_summary]
+        query = torch.stack(query_tokens, dim=1)
+        query = self.query_norm(query + self.query_role_embeddings[: query.size(1)].unsqueeze(0))
+
+        patch_tokens = self.patch_norm(patch_bank)
+        patch_tokens = patch_tokens + self.patch_type_embedding
+        patch_tokens = patch_tokens + self.selected_patch_embedding(selected_mask.long())
+        context_tokens = self.context_norm(context_hidden) + self.context_type_embedding
+        memory = torch.cat([context_tokens, patch_tokens], dim=1)
+        if context_attention_mask is None:
+            context_valid = torch.ones(
+                context_hidden.shape[:2], dtype=torch.bool, device=context_hidden.device
+            )
+        else:
+            context_valid = context_attention_mask.to(device=context_hidden.device, dtype=torch.bool)
+        patch_valid = torch.ones(patch_bank.shape[:2], dtype=torch.bool, device=patch_bank.device)
+        memory_key_padding_mask = ~torch.cat([context_valid, patch_valid], dim=1)
+
+        for block in self.blocks:
+            query = block(query, memory, memory_key_padding_mask=memory_key_padding_mask)
+        controller_query = self.output_norm(query[:, 0, :])
+        type_logits = self.type_head(controller_query)
+        expanded_query = controller_query.unsqueeze(1).expand(-1, patch_tokens.size(1), -1)
+        patch_features = torch.cat(
+            [expanded_query, patch_tokens, expanded_query * patch_tokens],
+            dim=-1,
+        )
+        patch_logits = self.patch_scorer(patch_features).squeeze(-1)
+        return type_logits, patch_logits
+
+
 class QwenLVAR(nn.Module):
     """Minimal LVAR wrapper around Qwen2-VL with recurrent controller actions."""
 
@@ -131,7 +251,7 @@ class QwenLVAR(nn.Module):
             image_token_id/eos_token_id: Backbone token ids used in embedding/decode logic.
             latent_token/act_token: Learned recurrent control tokens.
             global_pool/region_pool: Attention scorers for visual-bank pooling.
-            controller: Candidate-aware policy over PATCH/THINK/STOP and image patches.
+            controller: Configured MLP or transformer policy over PATCH/THINK/STOP and image patches.
             step_embedding: Embedding table for recurrent step index.
             _current_image_grid: Cached (H, W) grid read from processor outputs.
         """
@@ -147,6 +267,9 @@ class QwenLVAR(nn.Module):
         self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
         self.action_selection = cfg.get("action_selection", "argmax")
         self.controller_temperature = float(cfg.get("controller_temperature", 1.0))
+        self.controller_architecture = str(cfg.get("controller_architecture", "mlp")).strip().lower()
+        if self.controller_architecture not in {"mlp", "transformer"}:
+            raise ValueError("controller_architecture must be either 'mlp' or 'transformer'.")
         self.action_names = normalize_action_names(cfg.get("controller_action_names"))
         if self.action_names != ACTION_NAMES:
             raise ValueError(
@@ -229,12 +352,29 @@ class QwenLVAR(nn.Module):
         self.global_pool = nn.Linear(self.hidden_size, 1)
         self.region_pool = nn.Linear(self.hidden_size, 1)
         self.controller_state_norm = nn.LayerNorm(self.hidden_size)
-        self.controller = ControllerV2(
-            self.hidden_size,
-            len(self.action_names),
-            use_control_tokens=self.use_control_tokens,
-            controller_num_states=self.controller_num_states,
-        )
+        if self.controller_architecture == "transformer":
+            self.controller = TransformerController(
+                self.hidden_size,
+                len(self.action_names),
+                use_control_tokens=self.use_control_tokens,
+                controller_num_states=self.controller_num_states,
+                num_layers=int(cfg.get("controller_transformer_layers", 2)),
+                num_heads=int(
+                    cfg.get(
+                        "controller_transformer_heads",
+                        self._default_controller_transformer_heads(self.hidden_size),
+                    )
+                ),
+                dropout=float(cfg.get("controller_transformer_dropout", 0.1)),
+                feedforward_multiplier=int(cfg.get("controller_transformer_ff_multiplier", 4)),
+            )
+        else:
+            self.controller = ControllerV2(
+                self.hidden_size,
+                len(self.action_names),
+                use_control_tokens=self.use_control_tokens,
+                controller_num_states=self.controller_num_states,
+            )
         self.step_embedding = nn.Embedding(self.controller_max_steps, self.hidden_size)
 
         # Freeze backbone to keep training focused on controller-driven reasoning behavior.
@@ -247,6 +387,14 @@ class QwenLVAR(nn.Module):
         self.trace_boost_runtime = TraceAttentionBoostRuntime(self.trace_boost_config)
         self.trace_boost_runtime.install(self.backbone)
         self.to(self.device)
+
+    @staticmethod
+    def _default_controller_transformer_heads(hidden_size: int) -> int:
+        """Choose a compact head count that divides the backbone hidden width."""
+        for candidate in (8, 4, 2, 1):
+            if hidden_size % candidate == 0:
+                return candidate
+        return 1
 
     def _load_processor(self) -> Any:
         """Load processor/tokenizer and register latent special tokens if requested."""
@@ -1540,6 +1688,36 @@ class QwenLVAR(nn.Module):
         state_hidden = normalized.reshape(normalized.size(0), -1)
         return state_hidden, None
 
+    def _controller_forward(
+        self,
+        state_hidden: torch.Tensor,
+        step_hidden: torch.Tensor,
+        bank: Dict[str, torch.Tensor],
+        state: Dict[str, Any],
+        act_hidden: Optional[torch.Tensor],
+        final_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the configured MLP or transformer policy with a shared output interface."""
+        patch_bank = bank["patch_hidden"]
+        selected_mask = self._selected_patch_mask(state, bank)
+        if self.controller_architecture == "transformer":
+            return self.controller(
+                state_hidden,
+                step_hidden,
+                patch_bank,
+                selected_mask,
+                act_hidden=act_hidden,
+                context_hidden=final_hidden,
+                context_attention_mask=state["attention_mask"],
+            )
+        return self.controller(
+            state_hidden,
+            step_hidden,
+            patch_bank,
+            selected_mask,
+            act_hidden=act_hidden,
+        )
+
     def controller_logits_from_state(
         self,
         state: Dict[str, Any],
@@ -1559,12 +1737,13 @@ class QwenLVAR(nn.Module):
         final_hidden = self._extract_final_hidden(outputs)
         state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         step_hidden = self._controller_step_hidden(step_idx)
-        type_logits, patch_logits = self.controller(
+        type_logits, patch_logits = self._controller_forward(
             state_hidden,
             step_hidden,
-            bank["patch_hidden"],
-            self._selected_patch_mask(state, bank),
-            act_hidden=act_hidden,
+            bank,
+            state,
+            act_hidden,
+            final_hidden,
         )
         return type_logits, patch_logits
 
@@ -1653,12 +1832,13 @@ class QwenLVAR(nn.Module):
         state_hidden, act_hidden = self._build_controller_state_hidden(final_hidden, state)
         # Step embedding gives the controller explicit notion of iteration depth.
         step_hidden = self._controller_step_hidden(step_idx)
-        type_logits, patch_logits = self.controller(
+        type_logits, patch_logits = self._controller_forward(
             state_hidden,
             step_hidden,
-            bank["patch_hidden"],
-            self._selected_patch_mask(state, bank),
-            act_hidden=act_hidden,
+            bank,
+            state,
+            act_hidden,
+            final_hidden,
         )
         scaled_type_logits = self._scale_controller_logits(type_logits)
         scaled_patch_logits = self._scale_controller_logits(patch_logits)

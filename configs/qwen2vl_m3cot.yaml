@@ -11,6 +11,13 @@ model:
   # The controller head is strictly PATCH / THINK / STOP.  Legacy oracle
   # REGION and GLOBAL choices are filtered before SFT supervision.
   controller_action_names: [PATCH, THINK, STOP]
+  # Existing lightweight policy remains the default. Set to transformer for
+  # cross-attention over the full current VLM hidden-state sequence.
+  controller_architecture: mlp
+  controller_transformer_layers: 2
+  controller_transformer_heads: 8
+  controller_transformer_dropout: 0.1
+  controller_transformer_ff_multiplier: 4
   controller_temperature: 1.0
   nucleus_insertion_enabled: false
   # Only PATCH is selectable by the controller.

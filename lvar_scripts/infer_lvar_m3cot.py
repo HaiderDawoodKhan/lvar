@@ -33,6 +33,20 @@ def load_config(config_path: str):
         return yaml.safe_load(handle)
 
 
+def parse_model_overrides(values):
+    """Parse repeated model key=value CLI overrides using YAML scalar syntax."""
+    overrides = {}
+    for raw_value in values or []:
+        if "=" not in raw_value:
+            raise ValueError(f"Model override must be key=value, got: {raw_value}")
+        key, value = raw_value.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Model override key cannot be empty: {raw_value}")
+        overrides[key] = yaml.safe_load(value)
+    return overrides
+
+
 def write_jsonl(path: Path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -130,6 +144,13 @@ def main() -> None:
         help="Do not load the optional VLM LoRA checkpoint from the config.",
     )
     parser.add_argument("--controller-path", default=None)
+    parser.add_argument(
+        "--model-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a model config value. Can be repeated; values are parsed as YAML scalars.",
+    )
     parser.add_argument("--use-coarse-context", action="store_true", default=False)
     parser.add_argument(
         "--nucleus-insertion",
@@ -153,6 +174,7 @@ def main() -> None:
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
+    config["model"].update(parse_model_overrides(args.model_override))
     config["model"] = apply_max_controller_steps_override(config["model"], args.max_controller_steps)
     config["model"] = apply_trace_boost_overrides(config["model"], args)
     dataset_cfg = config["dataset"]

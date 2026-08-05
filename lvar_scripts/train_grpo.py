@@ -96,7 +96,16 @@ def trainable_state_dict(model: torch.nn.Module) -> dict:
 def save_controller_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> None:
     """Save a controller-only checkpoint to the requested path."""
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(trainable_state_dict(model), checkpoint_path)
+    torch.save(
+        {
+            "state_dict": trainable_state_dict(model),
+            "metadata": {
+                "controller_architecture": getattr(model, "controller_architecture", "mlp"),
+                "action_names": getattr(model, "action_names", None),
+            },
+        },
+        checkpoint_path,
+    )
     print(f"Saved controller checkpoint to {checkpoint_path}")
 
 

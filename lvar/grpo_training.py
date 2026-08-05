@@ -129,6 +129,19 @@ def _check_action_names(model: torch.nn.Module, metadata: Dict[str, Any]) -> Non
         )
 
 
+def _check_controller_architecture(model: torch.nn.Module, metadata: Dict[str, Any]) -> None:
+    """Prevent silently loading an MLP controller checkpoint into the transformer, or vice versa."""
+    # Historical controller checkpoints predate architecture metadata and are
+    # therefore the original MLP policy by definition.
+    checkpoint_architecture = metadata.get("controller_architecture", "mlp")
+    model_architecture = getattr(model, "controller_architecture", "mlp")
+    if str(checkpoint_architecture).lower() != str(model_architecture).lower():
+        raise ValueError(
+            "Checkpoint controller_architecture "
+            f"{checkpoint_architecture!r} does not match model controller_architecture {model_architecture!r}."
+        )
+
+
 def load_vlm_lora_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path) -> bool:
     """Load only VLM LoRA weights from a Phase 4 checkpoint."""
     payload = _load_checkpoint_payload(checkpoint_path)
@@ -149,6 +162,7 @@ def load_controller_checkpoint(model: torch.nn.Module, checkpoint_path: str | Pa
         return False
     metadata = payload.get("metadata", {})
     _check_action_names(model, metadata)
+    _check_controller_architecture(model, metadata)
     state_dict = payload.get("state_dict", payload)
     controller_prefixes = ("controller.", "step_embedding.", "controller_state_norm.")
     controller_state = {
