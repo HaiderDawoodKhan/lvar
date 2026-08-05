@@ -1,12 +1,15 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 from lvar.grpo_training import (
     clipped_grpo_loss,
+    cross_entropy_reduction_reward,
     load_controller_checkpoint,
+    map_rollout_actions_to_steps,
     normalize_group_rewards,
     select_controller_action,
     set_phase5_trainable,
@@ -17,6 +20,7 @@ from lvar.utils import ACTION_PATCH, ACTION_STOP
 from lvar_scripts.train_grpo import (
     asymmetric_baseline_weight,
     build_constant_with_warmup_scheduler,
+    compute_ce_reduction_only_reward,
     compute_correctness_only_reward,
     compute_grpo_policy_loss,
     iter_minibatches,
@@ -25,6 +29,81 @@ from test_model import build_model
 
 
 class GRPOTrainingTests(unittest.TestCase):
+    def test_rollout_actions_map_to_at_most_five_contiguous_steps(self):
+        actions = [{"type": "PATCH", "patch_idx": index} for index in range(6)]
+        actions.append({"type": "STOP"})
+
+        blocks = map_rollout_actions_to_steps(actions, max_steps=5)
+
+        self.assertEqual([[action["patch_idx"] for action in block] for block in blocks], [[0, 1], [2], [3], [4], [5]])
+
+    def test_ce_reduction_uses_remaining_rationale_and_no_action_baseline(self):
+        class DummyModel:
+            @staticmethod
+            def clone_state(state):
+                return dict(state)
+
+        seen_targets = []
+        seen_answer_instruction_flags = []
+
+        def fake_prepare(model, image, question, image_size=None, add_answer_instruction=True):
+            del model, image, question, image_size
+            seen_answer_instruction_flags.append(add_answer_instruction)
+            return {"score": 0.0}, {}
+
+        def fake_apply(model, state, bank, actions):
+            del model, bank
+            state["score"] += float(len(actions))
+            return state
+
+        def fake_ce(model, state, target):
+            del model
+            seen_targets.append(target)
+            return torch.tensor(10.0 - state["score"])
+
+        rollout = {
+            "actions": [
+                {"type": "PATCH", "patch_idx": 10},
+                {"type": "THINK"},
+                {"type": "PATCH", "patch_idx": 34},
+                {"type": "STOP"},
+            ]
+        }
+        example = {
+            "image": "image",
+            "question": "question",
+            "rationale": "S1. S2. S3. S4. S5. S6.",
+            "gold_answer": "A",
+        }
+
+        with patch("lvar.grpo_training.prepare_full_context_state_and_bank", fake_prepare), patch(
+            "lvar.grpo_training.apply_counterfactual_actions", fake_apply
+        ), patch("lvar.grpo_training.differentiable_state_ce", fake_ce):
+            reward = cross_entropy_reduction_reward(DummyModel(), rollout, example, max_steps=5)
+
+        self.assertEqual(reward["ce_reward_steps"], 3.0)
+        self.assertAlmostEqual(reward["r_ce_reduction"], 1.0)
+        self.assertEqual(seen_answer_instruction_flags, [False])
+        # Step one scores s3..s6 plus the answer before and after PATCH 10.
+        self.assertEqual(seen_targets[0], "S3.\nS4.\nS5.\nS6.\nTherefore, the answer is A")
+        self.assertEqual(seen_targets[1], seen_targets[0])
+        self.assertEqual(seen_targets[-1], "Therefore, the answer is A")
+
+    def test_ce_reduction_reward_has_no_heuristic_weighting(self):
+        components = {
+            "r_ce_reduction": 0.25,
+            "ce_noop_mean": 2.0,
+            "ce_selected_mean": 1.75,
+            "ce_reduction_sum": 0.5,
+            "ce_reward_steps": 2.0,
+        }
+        rollout = {"actions": [], "selected_visual_actions": [], "num_steps": 0}
+
+        reward = compute_ce_reduction_only_reward(components, correctness_score=1.0, rollout=rollout)
+
+        self.assertEqual(reward["reward"], 0.25)
+        self.assertEqual(reward["r_correct"], 1.0)
+
     def test_controller_checkpoint_rejects_architecture_mismatch(self):
         model = build_model(
             controller_architecture="transformer",

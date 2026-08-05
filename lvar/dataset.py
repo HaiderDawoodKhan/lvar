@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 
 from torch.utils.data import Dataset
 
-from lvar.oracle_mining import group_steps_to_max, split_rationale_into_sentences
+from lvar.rationale import group_steps_to_max, split_rationale_into_sentences
 from lvar.utils import extract_tagged_answer, normalize_answer_text
 
 try:

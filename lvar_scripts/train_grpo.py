@@ -19,6 +19,7 @@ from lvar.grpo_training import (
     clipped_grpo_loss,
     clipped_grpo_diagnostics,
     compute_phase5_reward,
+    cross_entropy_reduction_reward,
     load_controller_checkpoint,
     load_vlm_lora_checkpoint,
     normalize_group_rewards as phase5_normalize_group_rewards,
@@ -41,6 +42,20 @@ def load_config(config_path: str):
     """Load YAML config values shared across scripts."""
     with open(config_path, "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def parse_config_overrides(values: list[str]) -> dict:
+    """Parse repeated ``key=value`` CLI overrides using YAML scalar syntax."""
+    overrides = {}
+    for raw_value in values:
+        if "=" not in raw_value:
+            raise ValueError(f"Config override must be key=value, got: {raw_value}")
+        key, value = raw_value.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Config override key cannot be empty: {raw_value}")
+        overrides[key] = yaml.safe_load(value)
+    return overrides
 
 
 def set_seed(seed: int) -> None:
@@ -144,6 +159,36 @@ def compute_correctness_only_reward(correctness_score: float, rollout: dict) -> 
     }
 
 
+def compute_ce_reduction_only_reward(
+    ce_components: dict,
+    correctness_score: float,
+    rollout: dict,
+) -> dict:
+    """Return CE reduction as the sole reward while retaining correctness metrics."""
+    actions = rollout.get("actions", [])
+    think_count = sum(1 for action in actions if str(action.get("type", "")).upper() == "THINK")
+    visual_count = len(rollout.get("selected_visual_actions") or [])
+    ce_reduction = float(ce_components["r_ce_reduction"])
+    return {
+        "reward": ce_reduction,
+        "r_ce_reduction": ce_reduction,
+        "r_correct": float(correctness_score),
+        "ce_noop_mean": float(ce_components["ce_noop_mean"]),
+        "ce_selected_mean": float(ce_components["ce_selected_mean"]),
+        "ce_reduction_sum": float(ce_components["ce_reduction_sum"]),
+        "ce_reward_steps": float(ce_components["ce_reward_steps"]),
+        "r_logp": 0.0,
+        "r_cf": 0.0,
+        "r_stop": 0.0,
+        "r_visual": 0.0,
+        "r_early_stop": 0.0,
+        "r_think_once": 0.0,
+        "think_count": float(think_count),
+        "visual_count": float(visual_count),
+        "num_steps": float(rollout.get("num_steps", len(actions))),
+    }
+
+
 def build_constant_with_warmup_scheduler(
     optimizer: torch.optim.Optimizer,
     total_steps: int,
@@ -204,6 +249,20 @@ def main() -> None:
         default=None,
         help="Save intermediate epoch checkpoints every N epochs. Use 0 to disable epoch checkpoints.",
     )
+    parser.add_argument(
+        "--phase5-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a phase5 config value. Can be repeated; values are parsed as YAML scalars.",
+    )
+    parser.add_argument(
+        "--model-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a model config value. Can be repeated; values are parsed as YAML scalars.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -212,7 +271,9 @@ def main() -> None:
 
     config = load_config(args.config)
     config["model"] = apply_model_loading_overrides(config["model"], args)
-    train_cfg = config.get("phase5", config.get("train", {}))
+    config["model"].update(parse_config_overrides(args.model_override))
+    train_cfg = dict(config.get("phase5", config.get("train", {})))
+    train_cfg.update(parse_config_overrides(args.phase5_override))
     dataset_cfg = config["dataset"]
     if "controller_max_steps" in train_cfg:
         config["model"]["controller_max_steps"] = int(train_cfg["controller_max_steps"])
@@ -335,11 +396,29 @@ def main() -> None:
     min_controller_actions_before_stop = int(train_cfg.get("min_controller_actions_before_stop", 2))
     min_visual_actions_before_stop = int(train_cfg.get("min_visual_actions_before_stop", 1))
     reward_mode = str(train_cfg.get("reward_mode", "shaped")).lower()
-    if reward_mode not in {"shaped", "correctness_only"}:
-        raise ValueError("phase5.reward_mode must be 'shaped' or 'correctness_only'.")
+    if reward_mode not in {"shaped", "correctness_only", "ce_reduction"}:
+        raise ValueError("phase5.reward_mode must be 'shaped', 'correctness_only', or 'ce_reduction'.")
     use_baseline_advantage_weighting = bool(
-        train_cfg.get("use_baseline_advantage_weighting", reward_mode != "correctness_only")
+        train_cfg.get("use_baseline_advantage_weighting", reward_mode == "shaped")
     )
+    if reward_mode == "ce_reduction" and use_baseline_advantage_weighting:
+        raise ValueError("CE-reduction GRPO does not support baseline advantage weighting.")
+    ce_reward_max_steps = int(train_cfg.get("ce_reduction_max_steps", 5))
+    ce_reduction_aggregation = str(train_cfg.get("ce_reduction_aggregation", "mean")).lower()
+    if reward_mode == "ce_reduction" and bool(train_cfg.get("include_correctness_reward", False)):
+        raise ValueError("CE-reduction GRPO keeps correctness as a metric; it cannot be mixed into the reward.")
+    if ce_reward_max_steps <= 0:
+        raise ValueError("phase5.ce_reduction_max_steps must be positive.")
+    if ce_reduction_aggregation not in {"mean", "sum"}:
+        raise ValueError("phase5.ce_reduction_aggregation must be 'mean' or 'sum'.")
+    reward_metadata = {"reward_mode": reward_mode}
+    if reward_mode == "ce_reduction":
+        reward_metadata.update(
+            {
+                "ce_reduction_max_steps": ce_reward_max_steps,
+                "ce_reduction_aggregation": ce_reduction_aggregation,
+            }
+        )
     lr_schedule = str(train_cfg.get("lr_schedule", "constant")).lower()
     if lr_schedule != "constant":
         raise ValueError("phase5.lr_schedule currently supports only 'constant'.")
@@ -427,6 +506,20 @@ def main() -> None:
                 rollout_scores.append(float(rollout_score))
                 if reward_mode == "correctness_only":
                     components = compute_correctness_only_reward(float(rollout_score), rollout)
+                elif reward_mode == "ce_reduction":
+                    ce_components = cross_entropy_reduction_reward(
+                        model,
+                        rollout,
+                        example,
+                        max_steps=ce_reward_max_steps,
+                        image_size=image_size,
+                        aggregation=ce_reduction_aggregation,
+                    )
+                    components = compute_ce_reduction_only_reward(
+                        ce_components,
+                        correctness_score=float(rollout_score),
+                        rollout=rollout,
+                    )
                 else:
                     components = compute_phase5_reward(
                         model,
@@ -494,7 +587,7 @@ def main() -> None:
                 "global_step": global_step,
                 "example_id": example.get("id"),
                 "dataset_partition": dataset_partition,
-                "reward_mode": reward_mode,
+                **reward_metadata,
                 "num_rollouts": group_size,
                 "prompt_batch_size": prompt_batch_size,
                 "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
@@ -676,6 +769,7 @@ def main() -> None:
                     "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
                     "trajectory_minibatch_size": trajectory_minibatch_size,
                     "gradient_accumulation_steps": gradient_accumulation_steps,
+                    **reward_metadata,
                 },
             )
 
@@ -702,6 +796,7 @@ def main() -> None:
                 "generation_prompt_microbatch_size": generation_prompt_microbatch_size,
                 "trajectory_minibatch_size": trajectory_minibatch_size,
                 "gradient_accumulation_steps": gradient_accumulation_steps,
+                **reward_metadata,
             },
         )
         write_json(
@@ -709,7 +804,7 @@ def main() -> None:
             {
                 "phase": "phase5_grpo",
                 "dataset_partition": dataset_partition,
-                "reward_mode": reward_mode,
+                **reward_metadata,
                 "num_epochs": num_epochs,
                 "num_prompts_seen": prompt_step,
                 "num_updates": global_step,

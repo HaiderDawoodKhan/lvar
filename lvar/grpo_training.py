@@ -13,6 +13,7 @@ from lvar.counterfactual_training import (
     build_negative_actions,
     differentiable_state_ce,
 )
+from lvar.rationale import split_rationale_into_sentences
 from lvar.utils import ACTION_NAMES, ACTION_PATCH, ACTION_STOP, ACTION_THINK, normalize_action_names
 
 
@@ -83,7 +84,10 @@ def save_phase5_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path, 
     """Save a Phase 5 controller checkpoint."""
     path = Path(checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": phase5_state_dict(model), "metadata": metadata or {}}, path)
+    checkpoint_metadata = dict(metadata or {})
+    checkpoint_metadata.setdefault("controller_architecture", getattr(model, "controller_architecture", "mlp"))
+    checkpoint_metadata.setdefault("action_names", getattr(model, "action_names", ACTION_NAMES))
+    torch.save({"state_dict": phase5_state_dict(model), "metadata": checkpoint_metadata}, path)
 
 
 def load_trainable_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path) -> bool:
@@ -240,10 +244,16 @@ def prepare_full_context_state_and_bank(
     image: Any,
     question: str,
     image_size: Optional[int] = None,
+    add_answer_instruction: bool = True,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     """Build Phase 5 full-image initial state and visual bank."""
     with torch.no_grad():
-        batch = model.prepare_inputs(image, question, image_size=image_size)
+        batch = model.prepare_inputs(
+            image,
+            question,
+            add_answer_instruction=add_answer_instruction,
+            image_size=image_size,
+        )
         image_tokens = model.get_projected_image_tokens(batch)
         batch["projected_image_tokens"] = image_tokens
         bank = model.build_visual_bank(image_tokens)
@@ -489,6 +499,152 @@ def clipped_grpo_diagnostics(
 def target_logprob(model: torch.nn.Module, state: Dict[str, Any], target_text: str) -> torch.Tensor:
     """Length-normalized average log-prob for target text."""
     return -differentiable_state_ce(model, state, target_text)
+
+
+def _partition_evenly(values: Sequence[Any], num_blocks: int) -> List[List[Any]]:
+    """Split values into contiguous blocks whose sizes differ by at most one."""
+    if num_blocks <= 0:
+        raise ValueError("num_blocks must be positive.")
+    base_size, remainder = divmod(len(values), num_blocks)
+    blocks: List[List[Any]] = []
+    start = 0
+    for block_idx in range(num_blocks):
+        block_size = base_size + int(block_idx < remainder)
+        blocks.append(list(values[start : start + block_size]))
+        start += block_size
+    return blocks
+
+
+def map_rollout_actions_to_steps(
+    actions: Sequence[Dict[str, Any]],
+    max_steps: int = 5,
+) -> List[List[Dict[str, Any]]]:
+    """Map non-STOP rollout actions into at most ``max_steps`` contiguous steps.
+
+    When a rollout has more actions than reasoning steps, each returned step is
+    a contiguous, near-even action block.  STOP only terminates the rollout and
+    is intentionally not assigned a rationale step or rewarded as evidence.
+    """
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive.")
+    selected_actions = [
+        copy.deepcopy(action)
+        for action in actions
+        if str(action.get("type", "")).upper() != "STOP"
+    ]
+    if not selected_actions:
+        return []
+    return _partition_evenly(selected_actions, min(len(selected_actions), int(max_steps)))
+
+
+def _rationale_text(example: Dict[str, Any]) -> str:
+    """Read the ungrouped gold rationale, falling back to the solution text."""
+    rationale = str(example.get("rationale") or "").strip()
+    if rationale:
+        return rationale
+    return str(example.get("solution") or "").strip()
+
+
+def _future_rationale_target(
+    rationale_blocks: Sequence[Sequence[str]],
+    step_idx: int,
+    answer: str,
+) -> str:
+    """Build the Phase-2-style target after the action assigned to one step."""
+    future_sentences = [
+        sentence
+        for block in rationale_blocks[step_idx + 1 :]
+        for sentence in block
+        if str(sentence).strip()
+    ]
+    future_text = "\n".join(str(sentence).rstrip() for sentence in future_sentences)
+    answer_text = str(answer or "").strip()
+    if future_text and answer_text:
+        return f"{future_text}\nTherefore, the answer is {answer_text}"
+    if answer_text:
+        return f"Therefore, the answer is {answer_text}"
+    return future_text
+
+
+def cross_entropy_reduction_reward(
+    model: torch.nn.Module,
+    rollout: Dict[str, Any],
+    example: Dict[str, Any],
+    max_steps: int = 5,
+    image_size: Optional[int] = None,
+    aggregation: str = "mean",
+) -> Dict[str, float]:
+    """Measure sequential CE reduction from a rollout relative to no new action.
+
+    Each non-STOP action is aligned with a gold-rationale step.  For a block at
+    step ``t``, the baseline is CE(remaining rationale after ``t`` + answer |
+    current state), while the selected score inserts that block first.  This is
+    the same local no-op comparison used during trace mining, aggregated across
+    the rollout without any heuristic reward weighting.
+    """
+    action_blocks = map_rollout_actions_to_steps(rollout.get("actions", []), max_steps=max_steps)
+    if not action_blocks:
+        return {
+            "r_ce_reduction": 0.0,
+            "ce_noop_mean": 0.0,
+            "ce_selected_mean": 0.0,
+            "ce_reduction_sum": 0.0,
+            "ce_reward_steps": 0.0,
+        }
+
+    answer = str(example.get("answer") or example.get("gold_answer") or "").strip()
+    sentences = split_rationale_into_sentences(_rationale_text(example))
+    rationale_blocks = _partition_evenly(sentences, len(action_blocks))
+    state, bank = prepare_full_context_state_and_bank(
+        model,
+        example["image"],
+        example["question"],
+        image_size=image_size,
+        # Match Phase 2 mining's image + question context for rationale CE.
+        add_answer_instruction=False,
+    )
+
+    noop_ces: List[float] = []
+    selected_ces: List[float] = []
+    reductions: List[float] = []
+    with torch.no_grad():
+        for step_idx, action_block in enumerate(action_blocks):
+            target_text = _future_rationale_target(rationale_blocks, step_idx, answer)
+            if not target_text.strip():
+                continue
+            ce_noop = differentiable_state_ce(model, state, target_text)
+            selected_state = model.clone_state(state)
+            apply_counterfactual_actions(model, selected_state, bank, action_block)
+            ce_selected = differentiable_state_ce(model, selected_state, target_text)
+            noop_value = float(ce_noop.detach().cpu().item())
+            selected_value = float(ce_selected.detach().cpu().item())
+            noop_ces.append(noop_value)
+            selected_ces.append(selected_value)
+            reductions.append(noop_value - selected_value)
+            apply_counterfactual_actions(model, state, bank, action_block)
+
+    if not reductions:
+        return {
+            "r_ce_reduction": 0.0,
+            "ce_noop_mean": 0.0,
+            "ce_selected_mean": 0.0,
+            "ce_reduction_sum": 0.0,
+            "ce_reward_steps": 0.0,
+        }
+    mode = str(aggregation).lower()
+    if mode == "mean":
+        reward = sum(reductions) / len(reductions)
+    elif mode == "sum":
+        reward = sum(reductions)
+    else:
+        raise ValueError("ce_reduction_aggregation must be 'mean' or 'sum'.")
+    return {
+        "r_ce_reduction": float(reward),
+        "ce_noop_mean": float(sum(noop_ces) / len(noop_ces)),
+        "ce_selected_mean": float(sum(selected_ces) / len(selected_ces)),
+        "ce_reduction_sum": float(sum(reductions)),
+        "ce_reward_steps": float(len(reductions)),
+    }
 
 
 def _wrong_same_image_actions(actions: Sequence[Dict[str, Any]], bank: Dict[str, torch.Tensor], rng: random.Random) -> List[Dict[str, Any]]:
